@@ -9,7 +9,7 @@ RUN pip install runpod websocket-client librosa requests
 
 WORKDIR /
 
-RUN git clone https://github.com/comfyananonymous/ComfyUI.git && \
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git && \
     cd /ComfyUI && \
     pip install -r requirements.txt
 
