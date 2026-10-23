@@ -1,19 +1,29 @@
 #!/bin/bash
 
-# Exit immediately if a command exits with a non-zero status.
-set -e
+# ComfyUI log file
+COMFY_LOG="/ComfyUI/comfyui.log"
 
-# Start ComfyUI in the background
-echo "Starting ComfyUI in the background..."
-python /ComfyUI/main.py --listen --use-sage-attention &
+echo "=== Starting ComfyUI in the background ==="
+cd /ComfyUI
 
-# Wait for ComfyUI to be ready
-echo "Waiting for ComfyUI to be ready..."
-max_wait=120  # 최대 2분 대기
+# ComfyUI ko --extra-model-paths-config ke sath run karein
+python main.py --listen 127.0.0.1 --port 8188 --extra-model-paths-config /ComfyUI/extra_model_paths.yaml --use-sage-attention > "$COMFY_LOG" 2>&1 &
+COMFY_PID=$!
+
+echo "Waiting for ComfyUI to be ready (PID: $COMFY_PID)..."
+max_wait=180
 wait_count=0
+
 while [ $wait_count -lt $max_wait ]; do
-    if curl -s http://127.0.0.1:8188/ > /dev/null 2>&1; then
-        echo "ComfyUI is ready!"
+    # Agar ComfyUI crash ho jaye toh turant log dikha kar exit karein
+    if ! kill -0 $COMFY_PID 2>/dev/null; then
+        echo "❌ Error: ComfyUI process crashed unexpectedly! Full logs:"
+        cat "$COMFY_LOG"
+        exit 1
+    fi
+
+    if python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/')" > /dev/null 2>&1; then
+        echo "✅ ComfyUI is ready!"
         break
     fi
     echo "Waiting for ComfyUI... ($wait_count/$max_wait)"
@@ -22,11 +32,11 @@ while [ $wait_count -lt $max_wait ]; do
 done
 
 if [ $wait_count -ge $max_wait ]; then
-    echo "Error: ComfyUI failed to start within $max_wait seconds"
+    echo "❌ Error: ComfyUI failed to start within $max_wait seconds. Full logs:"
+    cat "$COMFY_LOG"
     exit 1
 fi
 
-# Start the handler in the foreground
-# 이 스크립트가 컨테이너의 메인 프로세스가 됩니다.
-echo "Starting the handler..."
-exec python handler.py
+# Start the handler in the foreground with unbuffered output (-u)
+echo "=== Starting RunPod Handler ==="
+exec python -u /handler.py

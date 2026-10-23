@@ -18,3 +18,8 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test scripts with secrets & logs
+ul_infi2.py
+*.log
+

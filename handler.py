@@ -611,4 +611,8 @@ def handler(job):
             return {"error": f"Base64 인코딩 실패: {e}"}
 
 
-runpod.serverless.start({"handler": handler})
+runpod.serverless.start({
+    "handler": handler,
+    "concurrency_modifier": lambda current_concurrency: 1
+})
+
