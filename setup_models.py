@@ -30,93 +30,83 @@ def scan_and_link():
     except Exception as me:
         print(f"Error checking mounts: {me}")
 
-    # 1. Inspect search paths
-    search_roots = ["/runpod-volume", "/workspace", "/mnt", "/root"]
-    found_files = {}
-
-    for root_dir in search_roots:
-        if not os.path.exists(root_dir):
-            print(f"ℹ️ Search root does not exist: {root_dir}")
-            continue
-
-        print(f"\n📂 Inspecting {root_dir}:")
-        try:
-            entries = os.listdir(root_dir)
-            print(f"   Direct contents ({len(entries)} items): {entries[:20]}")
-        except Exception as e:
-            print(f"   Could not list {root_dir}: {e}")
-
-        # Recursive scan for safetensors/bin/pt
-        for root, dirs, files in os.walk(root_dir, followlinks=True):
-            for file in files:
-                if file.endswith((".safetensors", ".bin", ".pt", ".pth")):
-                    full_path = os.path.join(root, file)
-                    found_files[file] = full_path
-                    print(f"   Found model: {file} -> {full_path}")
-
-    # 2. Check standard directory links
-    volume_models_dir = "/runpod-volume/models"
-    if os.path.exists(volume_models_dir):
-        print(f"\n🔗 Linking from standard {volume_models_dir}:")
-        for sub in os.listdir(volume_models_dir):
-            src_sub = os.path.join(volume_models_dir, sub)
-            if os.path.isdir(src_sub):
-                dest_sub = os.path.join(COMFY_MODELS_DIR, sub)
-                os.makedirs(dest_sub, exist_ok=True)
-                for item in os.listdir(src_sub):
-                    src_file = os.path.join(src_sub, item)
-                    dest_file = os.path.join(dest_sub, item)
-                    if not os.path.exists(dest_file):
-                        try:
-                            os.symlink(src_file, dest_file)
-                            print(f"   Linked {item} to {dest_sub}")
-                        except Exception as e:
-                            print(f"   Failed to link {src_file}: {e}")
-
-    # 3. Direct matching and symlinking for known models
+    # 1. Direct standard path checks and symlinking (bypasses GeeseFS directory readdir limitations)
     print("\n🎯 Verifying / Symlinking required models:")
+    missing_models = []
+
     for model_name, subfolder in MODEL_DESTINATIONS.items():
         dest_dir = os.path.join(COMFY_MODELS_DIR, subfolder)
         os.makedirs(dest_dir, exist_ok=True)
         dest_path = os.path.join(dest_dir, model_name)
 
-        if os.path.exists(dest_path):
-            print(f"   ✅ [OK] {model_name} already present in {dest_dir}")
-            continue
+        # Candidate paths in volume/workspace
+        candidate_paths = [
+            os.path.join("/runpod-volume/models", subfolder, model_name),
+            os.path.join("/runpod-volume", subfolder, model_name),
+            os.path.join("/runpod-volume", model_name),
+            os.path.join("/workspace/models", subfolder, model_name),
+            os.path.join("/workspace", subfolder, model_name),
+            os.path.join("/workspace", model_name),
+        ]
 
-        if model_name in found_files:
-            src_path = found_files[model_name]
+        src_found = None
+        for cand in candidate_paths:
             try:
-                os.symlink(src_path, dest_path)
-                print(f"   ✅ [LINKED] {model_name} -> {dest_path}")
+                if os.path.exists(cand):
+                    src_found = cand
+                    break
+            except Exception:
+                pass
+
+        if src_found:
+            try:
+                if os.path.islink(dest_path) or os.path.exists(dest_path):
+                    os.remove(dest_path)
+                os.symlink(src_found, dest_path)
+                size_mb = os.path.getsize(dest_path) / (1024 * 1024)
+                print(f"   ✅ [LINKED] {model_name} ({size_mb:.1f} MB) -> {dest_path}")
             except Exception as e:
                 print(f"   ❌ Failed to symlink {model_name}: {e}")
         else:
-            # Fallback heuristic search
-            matched = False
-            for fname, fpath in found_files.items():
-                if model_name.lower().split(".")[0] in fname.lower():
-                    try:
-                        os.symlink(fpath, dest_path)
-                        print(f"   ✅ [HEURISTIC LINKED] {fname} as {dest_path}")
-                        matched = True
-                        break
-                    except Exception as e:
-                        print(f"   ❌ Failed heuristic link: {e}")
-            if not matched:
-                print(f"   ⚠️ [MISSING] {model_name} (expected in {dest_dir})")
+            missing_models.append((model_name, subfolder, dest_path))
 
-    # 4. Summary of ComfyUI model directories
+    # 2. Handle missing models (auto-download helper audio models if needed)
+    if missing_models:
+        print("\n⚠️ Handling missing models:")
+        auto_download_urls = {
+            "MelBandRoformer_fp16.safetensors": "https://huggingface.co/Kijai/MelBandRoFormer_comfy/resolve/main/MelBandRoformer_fp16.safetensors",
+            "wav2vec2-chinese-base_fp16.safetensors": "https://huggingface.co/Kijai/wav2vec2_safetensors/resolve/main/wav2vec2-chinese-base_fp16.safetensors"
+        }
+
+        for model_name, subfolder, dest_path in missing_models:
+            if model_name in auto_download_urls:
+                url = auto_download_urls[model_name]
+                print(f"   ⬇️ [AUTO-DOWNLOAD] Downloading {model_name}...")
+                vol_target = os.path.join("/runpod-volume/models", subfolder, model_name)
+                save_path = vol_target if os.path.exists("/runpod-volume/models") else dest_path
+                try:
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    import urllib.request
+                    urllib.request.urlretrieve(url, save_path)
+                    print(f"   ✅ Downloaded {model_name} to {save_path}")
+                    if save_path != dest_path:
+                        if os.path.islink(dest_path) or os.path.exists(dest_path):
+                            os.remove(dest_path)
+                        os.symlink(save_path, dest_path)
+                except Exception as de:
+                    print(f"   ❌ Failed auto-download for {model_name}: {de}")
+            else:
+                print(f"   ❌ [CRITICAL MISSING] {model_name} (expected in {dest_path})")
+
+    # 3. Summary of ComfyUI model directories
     print("\n📊 Final ComfyUI models directory status:")
     if os.path.exists(COMFY_MODELS_DIR):
         for sub in sorted(os.listdir(COMFY_MODELS_DIR)):
             sub_path = os.path.join(COMFY_MODELS_DIR, sub)
             if os.path.isdir(sub_path):
-                models_in_sub = os.listdir(sub_path)
+                models_in_sub = [f for f in os.listdir(sub_path) if not f.startswith("put_")]
                 if models_in_sub:
                     print(f"   📁 {sub}: {models_in_sub}")
-                else:
-                    print(f"   📁 {sub}: (empty)")
     print("=" * 60)
 
 if __name__ == "__main__":
