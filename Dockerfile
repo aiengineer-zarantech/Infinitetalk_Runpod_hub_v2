@@ -9,7 +9,7 @@ RUN pip install runpod websocket-client librosa requests
 
 WORKDIR /
 
-RUN git clone https://github.com/comfyanonymous/ComfyUI.git && \
+RUN git clone https://github.com/comfyananonymous/ComfyUI.git && \
     cd /ComfyUI && \
     pip install -r requirements.txt
 
@@ -46,16 +46,13 @@ RUN cd /ComfyUI/custom_nodes && \
     cd ComfyUI-WanVideoWrapper && \
     pip install -r requirements.txt
 
-# =====================================================================
-# MODELS DOWNLOAD SECTION (Yeh ab hata diya gaya hai, yeh volume se aayenge)
-# =====================================================================
-
 COPY . .
 
 # extra_model_paths ko ComfyUI folder mein copy karein
 RUN cp /extra_model_paths.yaml /ComfyUI/extra_model_paths.yaml
 
-# Entrypoint se CRLF hatao aur executable banayein
+# Entrypoint aur setup_models se CRLF hatao aur executable banayein
 RUN sed -i 's/\r$//' /entrypoint.sh && chmod 755 /entrypoint.sh
+RUN sed -i 's/\r$//' /setup_models.py && chmod 755 /setup_models.py
 
-CMD ["/entrypoint.sh"]
+CMD ["/entrypoint.sh"]

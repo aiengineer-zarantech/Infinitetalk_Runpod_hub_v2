@@ -163,7 +163,19 @@ def queue_prompt(prompt, input_type="image", person_count="single"):
         error_body = e.read().decode("utf-8", errors="replace")
         logger.error(f"HTTP 에러 발생: {e.code} - {e.reason}")
         logger.error(f"응답 내용: {error_body}")
-        raise Exception(f"ComfyUI HTTP {e.code} Error ({e.reason}): {error_body}")
+        diag_info = ""
+        try:
+            vol_content = os.listdir("/runpod-volume") if os.path.exists("/runpod-volume") else "DOES_NOT_EXIST"
+            comfy_models = {}
+            if os.path.exists("/ComfyUI/models"):
+                for sub in os.listdir("/ComfyUI/models"):
+                    p = os.path.join("/ComfyUI/models", sub)
+                    if os.path.isdir(p):
+                        comfy_models[sub] = os.listdir(p)[:5]
+            diag_info = f" | Diagnostics: /runpod-volume={vol_content}, /ComfyUI/models={comfy_models}"
+        except Exception as de:
+            diag_info = f" | Diagnostics error: {de}"
+        raise Exception(f"ComfyUI HTTP {e.code} Error ({e.reason}): {error_body}{diag_info}")
     except Exception as e:
         logger.error(f"프롬프트 전송 중 오류: {e}")
         raise

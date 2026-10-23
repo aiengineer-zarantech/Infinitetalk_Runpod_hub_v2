@@ -1,4 +1,4 @@
-runpod_volume_models:
+runpod_volume:
   base_path: /runpod-volume/models/
   checkpoints: checkpoints
   clip: clip
@@ -17,6 +17,40 @@ runpod_volume_models:
 
 runpod_volume_direct:
   base_path: /runpod-volume/
+  checkpoints: checkpoints
+  clip: clip
+  clip_vision: clip_vision
+  configs: configs
+  controlnet: controlnet
+  diffusion_models: diffusion_models
+  embeddings: embeddings
+  gligen: gligen
+  hypernetworks: hypernetworks
+  loras: loras
+  style_models: style_models
+  text_encoders: text_encoders
+  upscale_models: upscale_models
+  vae: vae
+
+workspace_models:
+  base_path: /workspace/models/
+  checkpoints: checkpoints
+  clip: clip
+  clip_vision: clip_vision
+  configs: configs
+  controlnet: controlnet
+  diffusion_models: diffusion_models
+  embeddings: embeddings
+  gligen: gligen
+  hypernetworks: hypernetworks
+  loras: loras
+  style_models: style_models
+  text_encoders: text_encoders
+  upscale_models: upscale_models
+  vae: vae
+
+workspace_direct:
+  base_path: /workspace/
   checkpoints: checkpoints
   clip: clip
   clip_vision: clip_vision

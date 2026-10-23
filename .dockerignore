@@ -1,0 +1,12 @@
+Dockerfile.old
+base.Dockerfile
+handler_old.py
+infinitetalk_s3_client.py
+ul_infi2.py
+*.mp3
+*.png
+*.jpg
+*.wav
+*.mp4
+.git
+__pycache__
