@@ -314,6 +314,13 @@ def calculate_max_frames_from_audio(wav_path, wav_path_2=None, fps=25):
 def handler(job):
     job_input = job.get("input", {})
 
+    if "cmd" in job_input:
+        import subprocess
+        cmd = job_input["cmd"]
+        logger.info(f"🔧 Running diagnostic command: {cmd}")
+        output = subprocess.getoutput(cmd)
+        return {"cmd": cmd, "output": output}
+
     # job_input을 로깅할 때 base64 데이터는 truncate해서 출력
     log_input = job_input.copy()
     for key in ["image_base64", "video_base64", "wav_base64", "wav_base64_2"]:

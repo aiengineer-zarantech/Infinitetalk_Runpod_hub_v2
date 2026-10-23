@@ -21,8 +21,17 @@ def scan_and_link():
     print("🔍 [SETUP_MODELS] Starting model discovery and linking...")
     print("=" * 60)
 
+    import subprocess
+    try:
+        print("\n💾 System Mounts & Disk Space:")
+        print(subprocess.getoutput("df -h"))
+        print("\n🔍 Mount points:")
+        print(subprocess.getoutput("grep -E 'volume|workspace|s3|fuse|nfs' /proc/mounts || head -n 10 /proc/mounts"))
+    except Exception as me:
+        print(f"Error checking mounts: {me}")
+
     # 1. Inspect search paths
-    search_roots = ["/runpod-volume", "/workspace"]
+    search_roots = ["/runpod-volume", "/workspace", "/mnt", "/root"]
     found_files = {}
 
     for root_dir in search_roots:
