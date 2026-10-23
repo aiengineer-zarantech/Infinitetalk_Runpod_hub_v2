@@ -6,7 +6,21 @@ COMFY_LOG="/ComfyUI/comfyui.log"
 echo "=== Starting ComfyUI in the background ==="
 cd /ComfyUI
 
+# Link models from /runpod-volume/models to /ComfyUI/models if volume exists
+if [ -d "/runpod-volume/models" ]; then
+    echo "Found /runpod-volume/models, linking subfolders to /ComfyUI/models..."
+    for dir in /runpod-volume/models/*; do
+        if [ -d "$dir" ]; then
+            base_dir=$(basename "$dir")
+            echo "Linking model directory: $base_dir"
+            mkdir -p "/ComfyUI/models/$base_dir"
+            ln -sfn "$dir"/* "/ComfyUI/models/$base_dir/" 2>/dev/null || true
+        fi
+    done
+fi
+
 # ComfyUI ko --extra-model-paths-config ke sath run karein
+
 python main.py --listen 127.0.0.1 --port 8188 --extra-model-paths-config /ComfyUI/extra_model_paths.yaml --use-sage-attention > "$COMFY_LOG" 2>&1 &
 COMFY_PID=$!
 

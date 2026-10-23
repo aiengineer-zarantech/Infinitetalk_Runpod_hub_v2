@@ -78,22 +78,43 @@ def save_base64_to_file(base64_data, temp_dir, output_filename):
         raise Exception(f"Base64 디코딩 실패: {e}")
 
 
-def process_input(input_data, temp_dir, output_filename, input_type):
-    """입력 데이터를 처리하여 파일 경로를 반환하는 함수"""
+COMFY_INPUT_DIR = "/ComfyUI/input"
+os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+
+
+def get_file_ext(url_or_data, default_ext=".jpg"):
+    """URL or string se file extension extract karein"""
+    try:
+        parsed = urllib.parse.urlparse(str(url_or_data)).path
+        ext = os.path.splitext(parsed)[1].lower()
+        if ext in [".png", ".jpg", ".jpeg", ".webp", ".mp4", ".wav", ".mp3", ".m4a", ".flac"]:
+            return ext
+    except Exception:
+        pass
+    return default_ext
+
+
+def process_input(input_data, filename, input_type):
+    """
+    ComfyUI ke /ComfyUI/input/ directory me file save/copy karein.
+    Returns (absolute_file_path, filename_for_comfy)
+    """
+    os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+    target_path = os.path.abspath(os.path.join(COMFY_INPUT_DIR, filename))
+
     if input_type == "path":
-        # 경로인 경우 그대로 반환
         logger.info(f"📁 경로 입력 처리: {input_data}")
-        return input_data
+        if os.path.abspath(input_data) != target_path:
+            shutil.copy2(input_data, target_path)
+        return target_path, filename
     elif input_type == "url":
-        # URL인 경우 다운로드
         logger.info(f"🌐 URL 입력 처리: {input_data}")
-        os.makedirs(temp_dir, exist_ok=True)
-        file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
-        return download_file_from_url(input_data, file_path)
+        download_file_from_url(input_data, target_path)
+        return target_path, filename
     elif input_type == "base64":
-        # Base64인 경우 디코딩하여 저장
-        logger.info(f"🔢 Base64 입력 처리")
-        return save_base64_to_file(input_data, temp_dir, output_filename)
+        logger.info("🔢 Base64 입력 처리")
+        save_base64_to_file(input_data, COMFY_INPUT_DIR, filename)
+        return target_path, filename
     else:
         raise Exception(f"지원하지 않는 입력 타입: {input_type}")
 
@@ -139,12 +160,14 @@ def queue_prompt(prompt, input_type="image", person_count="single"):
         logger.info(f"프롬프트 전송 성공: {result}")
         return result
     except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
         logger.error(f"HTTP 에러 발생: {e.code} - {e.reason}")
-        logger.error(f"응답 내용: {e.read().decode('utf-8')}")
-        raise
+        logger.error(f"응답 내용: {error_body}")
+        raise Exception(f"ComfyUI HTTP {e.code} Error ({e.reason}): {error_body}")
     except Exception as e:
         logger.error(f"프롬프트 전송 중 오류: {e}")
         raise
+
 
 
 def get_image(filename, subfolder, folder_type):
@@ -300,82 +323,106 @@ def handler(job):
 
     # 이미지/비디오 입력 처리
     media_path = None
+    media_node_name = None
     if input_type == "image":
-        # 이미지 입력 처리 (image_path, image_url, image_base64 중 하나만 사용)
         if "image_path" in job_input:
-            media_path = process_input(
-                job_input["image_path"], task_id, "input_image.jpg", "path"
+            ext = get_file_ext(job_input["image_path"], ".jpg")
+            media_path, media_node_name = process_input(
+                job_input["image_path"], f"{task_id}_input_image{ext}", "path"
             )
         elif "image_url" in job_input:
-            media_path = process_input(
-                job_input["image_url"], task_id, "input_image.jpg", "url"
+            ext = get_file_ext(job_input["image_url"], ".png")
+            media_path, media_node_name = process_input(
+                job_input["image_url"], f"{task_id}_input_image{ext}", "url"
             )
         elif "image_base64" in job_input:
-            media_path = process_input(
-                job_input["image_base64"], task_id, "input_image.jpg", "base64"
+            media_path, media_node_name = process_input(
+                job_input["image_base64"], f"{task_id}_input_image.png", "base64"
             )
         else:
-            # 기본값 사용
-            media_path = "/examples/image.jpg"
+            default_img = "/examples/image.jpg"
+            target = os.path.join(COMFY_INPUT_DIR, f"{task_id}_default_image.jpg")
+            if os.path.exists(default_img):
+                shutil.copy2(default_img, target)
+                media_path, media_node_name = target, f"{task_id}_default_image.jpg"
+            else:
+                media_path, media_node_name = default_img, "image.jpg"
             logger.info("기본 이미지 파일을 사용합니다: /examples/image.jpg")
     else:  # video
-        # 비디오 입력 처리 (video_path, video_url, video_base64 중 하나만 사용)
         if "video_path" in job_input:
-            media_path = process_input(
-                job_input["video_path"], task_id, "input_video.mp4", "path"
+            ext = get_file_ext(job_input["video_path"], ".mp4")
+            media_path, media_node_name = process_input(
+                job_input["video_path"], f"{task_id}_input_video{ext}", "path"
             )
         elif "video_url" in job_input:
-            media_path = process_input(
-                job_input["video_url"], task_id, "input_video.mp4", "url"
+            ext = get_file_ext(job_input["video_url"], ".mp4")
+            media_path, media_node_name = process_input(
+                job_input["video_url"], f"{task_id}_input_video{ext}", "url"
             )
         elif "video_base64" in job_input:
-            media_path = process_input(
-                job_input["video_base64"], task_id, "input_video.mp4", "base64"
+            media_path, media_node_name = process_input(
+                job_input["video_base64"], f"{task_id}_input_video.mp4", "base64"
             )
         else:
-            # 기본값 사용 (비디오가 없는 경우 기본 이미지 사용)
-            media_path = "/examples/image.jpg"
-            logger.info("기본 이미지 파일을 사용합니다: /examples/image.jpg")
+            default_vid = "/examples/image.jpg"
+            target = os.path.join(COMFY_INPUT_DIR, f"{task_id}_default_video.mp4")
+            if os.path.exists(default_vid):
+                shutil.copy2(default_vid, target)
+                media_path, media_node_name = target, f"{task_id}_default_video.mp4"
+            else:
+                media_path, media_node_name = default_vid, "image.jpg"
+            logger.info("기본 비디오 파일을 사용합니다: /examples/image.jpg")
 
-    # 오디오 입력 처리 (wav_path, wav_url, wav_base64 중 하나만 사용)
+    # 오디오 입력 처리
     wav_path = None
-    wav_path_2 = None  # 다중 인물용 두 번째 오디오
+    wav_node_name = None
+    wav_path_2 = None
+    wav_node_name_2 = None
 
     if "wav_path" in job_input:
-        wav_path = process_input(
-            job_input["wav_path"], task_id, "input_audio.wav", "path"
+        ext = get_file_ext(job_input["wav_path"], ".wav")
+        wav_path, wav_node_name = process_input(
+            job_input["wav_path"], f"{task_id}_input_audio{ext}", "path"
         )
     elif "wav_url" in job_input:
-        wav_path = process_input(
-            job_input["wav_url"], task_id, "input_audio.wav", "url"
+        ext = get_file_ext(job_input["wav_url"], ".wav")
+        wav_path, wav_node_name = process_input(
+            job_input["wav_url"], f"{task_id}_input_audio{ext}", "url"
         )
     elif "wav_base64" in job_input:
-        wav_path = process_input(
-            job_input["wav_base64"], task_id, "input_audio.wav", "base64"
+        wav_path, wav_node_name = process_input(
+            job_input["wav_base64"], f"{task_id}_input_audio.wav", "base64"
         )
     else:
-        # 기본값 사용
-        wav_path = "/examples/audio.mp3"
+        default_audio = "/examples/audio.mp3"
+        target = os.path.join(COMFY_INPUT_DIR, f"{task_id}_default_audio.mp3")
+        if os.path.exists(default_audio):
+            shutil.copy2(default_audio, target)
+            wav_path, wav_node_name = target, f"{task_id}_default_audio.mp3"
+        else:
+            wav_path, wav_node_name = default_audio, "audio.mp3"
         logger.info("기본 오디오 파일을 사용합니다: /examples/audio.mp3")
 
     # 다중 인물용 두 번째 오디오 처리
     if person_count == "multi":
         if "wav_path_2" in job_input:
-            wav_path_2 = process_input(
-                job_input["wav_path_2"], task_id, "input_audio_2.wav", "path"
+            ext = get_file_ext(job_input["wav_path_2"], ".wav")
+            wav_path_2, wav_node_name_2 = process_input(
+                job_input["wav_path_2"], f"{task_id}_input_audio_2{ext}", "path"
             )
         elif "wav_url_2" in job_input:
-            wav_path_2 = process_input(
-                job_input["wav_url_2"], task_id, "input_audio_2.wav", "url"
+            ext = get_file_ext(job_input["wav_url_2"], ".wav")
+            wav_path_2, wav_node_name_2 = process_input(
+                job_input["wav_url_2"], f"{task_id}_input_audio_2{ext}", "url"
             )
         elif "wav_base64_2" in job_input:
-            wav_path_2 = process_input(
-                job_input["wav_base64_2"], task_id, "input_audio_2.wav", "base64"
+            wav_path_2, wav_node_name_2 = process_input(
+                job_input["wav_base64_2"], f"{task_id}_input_audio_2.wav", "base64"
             )
         else:
-            # 기본값 사용 (첫 번째 오디오와 동일)
-            wav_path_2 = wav_path
+            wav_path_2, wav_node_name_2 = wav_path, wav_node_name
             logger.info("두 번째 오디오가 없어 첫 번째 오디오를 사용합니다.")
+
 
     # 필수 필드 검증 및 기본값 설정
     prompt_text = job_input.get("prompt", "A person talking naturally")
@@ -455,14 +502,14 @@ def handler(job):
 
     # 워크플로우 노드 설정
     if input_type == "image":
-        # I2V 워크플로우: 이미지 입력 설정
-        prompt["284"]["inputs"]["image"] = media_path
+        # I2V 워크플로우: 이미지 입력 설정 (ComfyUI /ComfyUI/input 기준 파일명 전달)
+        prompt["284"]["inputs"]["image"] = media_node_name
     else:
         # V2V 워크플로우: 비디오 입력 설정
-        prompt["228"]["inputs"]["video"] = media_path
+        prompt["228"]["inputs"]["video"] = media_node_name
 
     # 공통 설정
-    prompt["125"]["inputs"]["audio"] = wav_path
+    prompt["125"]["inputs"]["audio"] = wav_node_name
     prompt["241"]["inputs"]["positive_prompt"] = prompt_text
     prompt["245"]["inputs"]["value"] = width
     prompt["246"]["inputs"]["value"] = height
@@ -474,10 +521,11 @@ def handler(job):
         # 워크플로우 타입에 따라 두 번째 오디오 노드 설정
         if input_type == "image":  # I2V_multi.json의 경우
             if "307" in prompt:
-                prompt["307"]["inputs"]["audio"] = wav_path_2
+                prompt["307"]["inputs"]["audio"] = wav_node_name_2
         else:  # V2V_multi.json의 경우
             if "313" in prompt:
-                prompt["313"]["inputs"]["audio"] = wav_path_2
+                prompt["313"]["inputs"]["audio"] = wav_node_name_2
+
 
     ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
     logger.info(f"Connecting to WebSocket: {ws_url}")
