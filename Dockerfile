@@ -50,8 +50,12 @@ RUN cd /ComfyUI/custom_nodes && \
 # returns hidden_states (they are captured by a decorator on the parent forward),
 # and WanVideoWrapper's custom Wav2Vec2Model overrides that forward, so
 # MultiTalkWav2VecEmbeds (node 194) gets hidden_states=None and crashes.
-RUN pip install "transformers==4.57.6" && \
-    python -c "import transformers; v = transformers.__version__; print('transformers', v); assert v.startswith('4.'), v"
+# transformers 4.x needs huggingface_hub<1.0, and diffusers>=0.40 needs
+# huggingface_hub>=1.x (resolve_revision), which breaks the whole WanVideoWrapper
+# import. diffusers 0.39.0 is the last release that supports huggingface_hub 0.x.
+RUN pip install "transformers==4.57.6" "diffusers==0.39.0" && \
+    python -c "import transformers; v = transformers.__version__; print('transformers', v); assert v.startswith('4.'), v" && \
+    python -c "import diffusers.configuration_utils, diffusers, huggingface_hub; print('diffusers', diffusers.__version__, 'huggingface_hub', huggingface_hub.__version__)"
 
 COPY . .
 
