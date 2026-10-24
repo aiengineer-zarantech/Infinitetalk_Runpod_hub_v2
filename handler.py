@@ -11,6 +11,7 @@ import binascii  # Base64 에러 처리를 위해 import
 import subprocess
 import librosa
 import shutil
+import time
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -590,8 +591,11 @@ def handler(job):
                 f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}"
             )
             if http_attempt == max_http_attempts - 1:
+                # ComfyUI 프로세스가 죽은 원인을 응답에 포함 (comfyui.log 마지막 부분)
+                log_tail = subprocess.getoutput("tail -60 /ComfyUI/comfyui.log")
                 raise Exception(
-                    "ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요."
+                    "ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.\n"
+                    f"--- comfyui.log (tail) ---\n{log_tail}"
                 )
             time.sleep(1)
 
@@ -599,8 +603,6 @@ def handler(job):
     # 웹소켓 연결 시도 (최대 3분)
     max_attempts = int(180 / 5)  # 3분 (1초에 한 번씩 시도)
     for attempt in range(max_attempts):
-        import time
-
         try:
             ws.connect(ws_url)
             logger.info(f"웹소켓 연결 성공 (시도 {attempt+1})")
