@@ -46,6 +46,13 @@ RUN cd /ComfyUI/custom_nodes && \
     cd ComfyUI-WanVideoWrapper && \
     pip install -r requirements.txt
 
+# Pin transformers to 4.x. In transformers 5.x the Wav2Vec2 encoder no longer
+# returns hidden_states (they are captured by a decorator on the parent forward),
+# and WanVideoWrapper's custom Wav2Vec2Model overrides that forward, so
+# MultiTalkWav2VecEmbeds (node 194) gets hidden_states=None and crashes.
+RUN pip install "transformers==4.57.6" && \
+    python -c "import transformers; v = transformers.__version__; print('transformers', v); assert v.startswith('4.'), v"
+
 COPY . .
 
 # extra_model_paths ko ComfyUI folder mein copy karein

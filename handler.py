@@ -198,6 +198,25 @@ def get_history(prompt_id):
         return json.loads(response.read())
 
 
+class ComfyExecutionError(Exception):
+    """ComfyUI 노드 실행 실패 (websocket execution_error / execution_interrupted)"""
+
+    def __init__(self, message_type, data):
+        self.details = {
+            "type": message_type,
+            "node_id": data.get("node_id"),
+            "node_type": data.get("node_type"),
+            "exception_type": data.get("exception_type"),
+            "exception_message": (data.get("exception_message") or "").strip(),
+            "traceback": data.get("traceback", []),
+        }
+        super().__init__(
+            f"ComfyUI {message_type} at node {self.details['node_id']} "
+            f"({self.details['node_type']}): {self.details['exception_type']}: "
+            f"{self.details['exception_message']}"
+        )
+
+
 def get_videos(ws, prompt, input_type="image", person_count="single"):
     prompt_id = queue_prompt(prompt, input_type, person_count)["prompt_id"]
     logger.info(f"워크플로우 실행 시작: prompt_id={prompt_id}")
@@ -214,6 +233,10 @@ def get_videos(ws, prompt, input_type="image", person_count="single"):
                 if data["node"] is None and data["prompt_id"] == prompt_id:
                     logger.info("워크플로우 실행 완료")
                     break
+            elif message["type"] in ("execution_error", "execution_interrupted"):
+                data = message.get("data", {})
+                if data.get("prompt_id") == prompt_id:
+                    raise ComfyExecutionError(message["type"], data)
         else:
             continue
 
@@ -587,8 +610,13 @@ def handler(job):
             if attempt == max_attempts - 1:
                 raise Exception("웹소켓 연결 시간 초과 (3분)")
             time.sleep(5)
-    videos = get_videos(ws, prompt, input_type, person_count)
-    ws.close()
+    try:
+        videos = get_videos(ws, prompt, input_type, person_count)
+    except ComfyExecutionError as e:
+        logger.error(f"❌ {e}\n{''.join(e.details['traceback'])}")
+        return {"error": str(e), "details": e.details}
+    finally:
+        ws.close()
     logger.info("웹소켓 연결 종료")
 
     # 비디오가 없는 경우 처리
