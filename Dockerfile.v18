@@ -1,0 +1,54 @@
+# ==============================================================================
+# Dockerfile.v18 - Faster cold start + GPU guard + job watchdog on top of v17
+# ==============================================================================
+# Adds worker_guard/, the new entrypoint.sh and setup_models.py, and patches the base
+# image's OWN /handler.py with 2 lines (the local handler.py is never copied).
+# Installs nothing: the last step proves the ComfyUI pip freeze is unchanged.
+# ENTRYPOINT/CMD/WORKDIR are inherited unchanged (CMD ["/entrypoint.sh"]).
+FROM digamberjhazaran/infinitetalk-runpod:v17
+
+SHELL ["/bin/bash", "-c"]
+
+# 1. Baseline freeze of the ComfyUI Python environment
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt
+
+# 2. New startup files; print what changed versus v17 for the build log
+RUN cp /entrypoint.sh /tmp/entrypoint.sh.orig && cp /setup_models.py /tmp/setup_models.py.orig
+COPY worker_guard/ /worker_guard/
+COPY entrypoint.sh /entrypoint.sh
+COPY setup_models.py /setup_models.py
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod 755 /entrypoint.sh && \
+    sed -i 's/\r$//' /setup_models.py && chmod 755 /setup_models.py && \
+    find /worker_guard -name '*.py' -exec sed -i 's/\r$//' {} + && \
+    echo "=== /entrypoint.sh diff vs v17 ===" && { diff -u /tmp/entrypoint.sh.orig /entrypoint.sh || true; } && \
+    echo "=== /setup_models.py diff vs v17 ===" && { diff -u /tmp/setup_models.py.orig /setup_models.py || true; } && \
+    rm -f /tmp/entrypoint.sh.orig /tmp/setup_models.py.orig
+
+# 3. Patch the base image's own /handler.py (fails on 0 or >1 anchors, or if already patched)
+COPY scripts/patch_handler_guard.py /tmp/patch_handler_guard.py
+RUN cp /handler.py /tmp/handler.py.orig && \
+    /usr/bin/python3.10 /tmp/patch_handler_guard.py /handler.py && \
+    echo "=== /handler.py diff (expect exactly 2 added lines) ===" && \
+    { diff -u /tmp/handler.py.orig /handler.py; rc=$?; [ "$rc" -eq 1 ] || { echo "❌ Patch produced no diff or diff failed (rc=$rc)"; exit 1; }; } && \
+    rm -f /tmp/patch_handler_guard.py /tmp/handler.py.orig
+
+# 4. Import checks with the interpreter the worker uses, from / like the handler
+RUN cd / && python -c "import worker_guard.job_guard, worker_guard.comfy_api, worker_guard.startup_check, setup_models; print('worker_guard + setup_models import OK')" && \
+    which python python3 && python --version && python3 --version
+
+# 5. The installed runpod SDK must honor "refresh_worker" in handler output
+RUN python -c "\
+import os, runpod; \
+root = os.path.dirname(runpod.__file__); \
+hits = [os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs if f.endswith('.py') and 'refresh_worker' in open(os.path.join(d, f), encoding='utf-8', errors='ignore').read()]; \
+print('runpod', getattr(runpod, '__version__', '?'), 'refresh_worker found in:', hits); \
+assert hits, 'installed runpod SDK has no refresh_worker support'"
+
+# 6. LAST RUN STEP: freeze verification (zero package drift)
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "❌ CRITICAL ERROR: ComfyUI Python environment changed during the v18 build!"; \
+        exit 1; \
+    } && \
+    rm -f /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt && \
+    echo "✅ ComfyUI Python environment verified untouched. Zero drift detected."

@@ -1,0 +1,4 @@
+# Test-only dependencies for the worker TTS tests (never installed in the worker image).
+# Run on Windows without a GPU: python -m pytest tests -p no:cacheprovider
+# numpy is used from the system Python (venv created with --system-site-packages).
+pytest==9.1.1

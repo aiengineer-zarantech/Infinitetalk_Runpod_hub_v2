@@ -121,6 +121,10 @@ def process_input(input_data, filename, input_type):
 
 
 def queue_prompt(prompt, input_type="image", person_count="single"):
+    # Offload fail-safe right before /prompt (also with WORKER_GUARD_ENABLED=0); logs "[OFFLOAD] final: ..."
+    from worker_guard.job_guard import final_offload_check
+    final_offload_check(prompt)
+
     url = f"http://{server_address}:8188/prompt"
     logger.info(f"Queueing prompt to: {url}")
     p = {"prompt": prompt, "client_id": client_id}
@@ -338,6 +342,10 @@ def calculate_max_frames_from_audio(wav_path, wav_path_2=None, fps=25):
 def handler(job):
     job_input = job.get("input", {})
 
+    if job_input.get("task") == "tts":
+        from tts.tts_handler import handle_tts
+        return handle_tts(job_input)
+
     if "cmd" in job_input:
         import subprocess
         cmd = job_input["cmd"]
@@ -520,9 +528,39 @@ def handler(job):
         # setdefault를 사용하여 'inputs' 딕셔너리가 없으면 생성
         inputs = prompt[sampler_node_id].setdefault("inputs", {})
         inputs["force_offload"] = force_offload
-        logger.info(f"✅ 노드 {sampler_node_id} (WanVideoSampler) 업데이트됨: force_offload={force_offload}")
     else:
         logger.warning("⚠️ 경고: WanVideoSampler 노드를 찾을 수 없습니다. 워크플로우 기본값을 사용합니다.")
+    # ------------------------------------------------------------------
+    # 동적 Block Swap 및 VRAM 최적화 설정 (24GB VRAM OOM / Bus error 방지)
+    # ------------------------------------------------------------------
+    # 기본값 0: 모델 전체를 GPU에 상주 (24GB VRAM 기준). OOM 발생 시 입력으로 blocks_to_swap 지정
+    blocks_to_swap = int(job_input.get("blocks_to_swap", 0))
+    offload = blocks_to_swap > 0
+    load_device = job_input.get("load_device", "offload_device" if offload else "main_device")
+    for node_id, node_data in prompt.items():
+        ctype = node_data.get("class_type")
+        if ctype == "WanVideoBlockSwap":
+            inp = node_data.setdefault("inputs", {})
+            inp["blocks_to_swap"] = blocks_to_swap
+            inp["offload_img_emb"] = offload
+            inp["offload_txt_emb"] = offload
+            logger.info(f"✅ 노드 {node_id} (WanVideoBlockSwap) 업데이트됨: blocks_to_swap={blocks_to_swap}")
+        elif ctype == "WanVideoModelLoader":
+            inp = node_data.setdefault("inputs", {})
+            inp["load_device"] = load_device
+            logger.info(f"✅ 노드 {node_id} (WanVideoModelLoader) 업데이트됨: load_device={load_device}")
+            if job_input.get("base_precision"):
+                inp["base_precision"] = job_input["base_precision"]
+            elif inp.get("base_precision") == "fp16_fast":
+                inp["base_precision"] = "bf16"
+        elif ctype == "WanVideoLoraSelect":
+            inp = node_data.setdefault("inputs", {})
+            inp["low_mem_load"] = True
+        elif job_input.get("vae_tiling") and ctype in ("WanVideoImageToVideoMultiTalk", "WanVideoDecode", "WanVideoEncode"):
+            # Test input (TESTING.md step 2c): tiled VAE for the per-window decode/encode and the final decode
+            inp = node_data.setdefault("inputs", {})
+            inp["tiled_vae" if ctype == "WanVideoImageToVideoMultiTalk" else "enable_vae_tiling"] = True
+            logger.info(f"✅ 노드 {node_id} ({ctype}) VAE tiling on")
     # ------------------------------------------------------------------
 
     # 파일 존재 여부 확인
@@ -617,6 +655,32 @@ def handler(job):
     except ComfyExecutionError as e:
         logger.error(f"❌ {e}\n{''.join(e.details['traceback'])}")
         return {"error": str(e), "details": e.details}
+    except Exception as e:
+        comfy_log_tail = ""
+        try:
+            with open("/ComfyUI/comfyui.log", "r", errors="ignore") as f:
+                comfy_log_tail = "".join(f.readlines()[-150:])
+        except Exception:
+            pass
+        # OOM kill 여부 (cgroup v2 / v1) 및 GPU 상태
+        memory_events = subprocess.getoutput(
+            "cat /sys/fs/cgroup/memory.events 2>/dev/null || cat /sys/fs/cgroup/memory/memory.oom_control 2>/dev/null"
+        )
+        gpu_state = subprocess.getoutput(
+            "nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv 2>&1"
+        )
+        comfy_alive = subprocess.getoutput("pgrep -f 'python main.py' || echo 'ComfyUI process not running'")
+        logger.error(
+            f"❌ ComfyUI 실행 중 오류/크래시 발생: {e}\nComfyUI log:\n{comfy_log_tail}\n"
+            f"memory.events:\n{memory_events}\nGPU:\n{gpu_state}\nComfyUI PID: {comfy_alive}"
+        )
+        return {
+            "error": f"{type(e).__name__}: {str(e)}",
+            "comfyui_log": comfy_log_tail,
+            "memory_events": memory_events,
+            "gpu_state": gpu_state,
+            "comfyui_pid": comfy_alive,
+        }
     finally:
         ws.close()
     logger.info("웹소켓 연결 종료")
@@ -708,6 +772,8 @@ def handler(job):
             return {"error": f"Base64 인코딩 실패: {e}"}
 
 
+from worker_guard.job_guard import install as install_job_guard
+handler, get_videos = install_job_guard(handler, get_videos)
 runpod.serverless.start({
     "handler": handler,
     "concurrency_modifier": lambda current_concurrency: 1

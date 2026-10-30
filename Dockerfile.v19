@@ -1,0 +1,30 @@
+# ==============================================================================
+# Dockerfile.v19 - Automatic VRAM-based offloading on top of v18
+# ==============================================================================
+# Replaces only /worker_guard (adds offload.py). /handler.py, /entrypoint.sh,
+# /setup_models.py and the workflows are inherited from v18 unchanged.
+# Installs nothing: the last step proves the ComfyUI pip freeze is unchanged.
+FROM digamberjhazaran/infinitetalk-runpod:v18
+
+SHELL ["/bin/bash", "-c"]
+
+# 1. Baseline freeze + fingerprints of the files this image must NOT change
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
+    sha256sum /handler.py /entrypoint.sh /setup_models.py /I2V_single.json /I2V_multi.json /V2V_single.json /V2V_multi.json > /tmp/unchanged.sha256
+
+# 2. New worker_guard (whole folder replaced so no stale module survives)
+RUN rm -rf /worker_guard
+COPY worker_guard/ /worker_guard/
+RUN find /worker_guard -name '*.py' -exec sed -i 's/\r$//' {} + && \
+    grep -q "install_job_guard(handler, get_videos)" /handler.py && \
+    cd / && python -c "import worker_guard.job_guard, worker_guard.offload, worker_guard.comfy_api, worker_guard.startup_check, setup_models; from worker_guard import offload; print('worker_guard import OK, tiers:', offload.load_tiers())"
+
+# 3. LAST RUN STEP: unchanged files + zero package drift
+RUN sha256sum -c /tmp/unchanged.sha256 && \
+    /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "❌ CRITICAL ERROR: files or the ComfyUI Python environment changed during the v19 build!"; \
+        exit 1; \
+    } && \
+    rm -f /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt /tmp/unchanged.sha256 && \
+    echo "✅ handler/entrypoint/setup_models/workflows unchanged. Zero package drift."

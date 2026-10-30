@@ -1,0 +1,51 @@
+# ==============================================================================
+# Dockerfile.v22 - PROFILE=1 per-window timing on top of v21 (off by default)
+# ==============================================================================
+# Adds /ComfyUI/custom_nodes/zz_worker_profiler (a package that defines NO nodes and does
+# nothing unless PROFILE=1) and replaces /worker_guard (node_timer.py + 5-line PROFILE hook in
+# job_guard.py). handler, entrypoint, setup_models, all six workflow files and every existing
+# custom node file are inherited from v21 (checked). Installs nothing (pip freeze checked).
+FROM digamberjhazaran/infinitetalk-runpod:v21
+
+SHELL ["/bin/bash", "-c"]
+
+# 1. Baseline freeze + fingerprints of the files this image must NOT change
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
+    sha256sum /handler.py /entrypoint.sh /setup_models.py /I2V_single.json /I2V_multi.json /V2V_single.json /V2V_multi.json \
+        /I2V_single_compiled.json /I2V_multi_compiled.json > /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes.sha256 && \
+    test ! -e /ComfyUI/custom_nodes/zz_worker_profiler
+
+# 2. New worker_guard (whole folder replaced so no stale module survives) + the profiler package
+RUN rm -rf /worker_guard
+COPY worker_guard/ /worker_guard/
+COPY comfy_profiler/ /ComfyUI/custom_nodes/zz_worker_profiler/
+COPY scripts/verify_profiler_contract.py scripts/check_profiler_install.py /tmp/profiler_checks/
+RUN find /worker_guard /ComfyUI/custom_nodes/zz_worker_profiler /tmp/profiler_checks -name '*.py' -exec sed -i 's/\r$//' {} + && \
+    rm -rf /ComfyUI/custom_nodes/zz_worker_profiler/__pycache__ && \
+    grep -q "install_job_guard(handler, get_videos)" /handler.py && \
+    cd / && python -c "import worker_guard.job_guard, worker_guard.node_timer, worker_guard.accel, worker_guard.speed, setup_models; print('worker_guard import OK')"
+
+# 3. Profiler checks: source contract (ast), OFF by default, and a real install on the loaded wrapper (CPU).
+#    The marker proves the checks wrote nothing into /ComfyUI or the root files.
+RUN set -e && touch /tmp/profiler_marker && \
+    /usr/bin/python3.10 /tmp/profiler_checks/verify_profiler_contract.py /ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper && \
+    cd /ComfyUI/custom_nodes && env -u PROFILE PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.10 -c "import sys, zz_worker_profiler as p; assert p.NODE_CLASS_MAPPINGS == {} and 'zz_worker_profiler.profiler' not in sys.modules; print('profiler package OFF without PROFILE: OK')" && \
+    env -u PROFILE PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.10 /tmp/profiler_checks/check_profiler_install.py /ComfyUI && \
+    changed=$(find /ComfyUI /handler.py /entrypoint.sh /setup_models.py /worker_guard -newer /tmp/profiler_marker -print 2>/dev/null) && \
+    if [ -n "$changed" ]; then echo "ERROR: profiler checks wrote files:"; echo "$changed"; exit 1; fi && \
+    rm -rf /tmp/profiler_checks /tmp/profiler_marker && \
+    echo "OK: profiler contract + install checks OK, nothing written"
+
+# 4. LAST RUN STEP: unchanged files + unchanged custom nodes + zero package drift
+RUN sha256sum -c --quiet /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -not -path '/ComfyUI/custom_nodes/zz_worker_profiler/*' -print0 \
+        | sort -z | xargs -0 sha256sum > /tmp/custom_nodes_post.sha256 && \
+    diff -u /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
+    /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "CRITICAL ERROR: files, custom nodes or the ComfyUI Python environment changed during the v22 build!"; \
+        exit 1; \
+    } && \
+    rm -f /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt /tmp/unchanged.sha256 /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
+    echo "OK: handler/entrypoint/setup_models/all workflows/existing custom nodes unchanged. Zero package drift."

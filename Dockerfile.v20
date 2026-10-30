@@ -1,0 +1,37 @@
+# ==============================================================================
+# Dockerfile.v20 - torch.compile (lossless path), [SPEED] measurement, benchmark mode,
+# FP8_FAST test switch (off by default) and the new offload tiers, on top of v19.
+# ==============================================================================
+# Adds the two compiled workflow copies and replaces /worker_guard. The original workflows,
+# /handler.py, /entrypoint.sh and /setup_models.py are inherited from v19 unchanged (checked).
+# The build FAILS if the compiled workflows or FP8_FAST use node/input names that do not exist
+# in the installed ComfyUI-WanVideoWrapper. Installs nothing (pip freeze checked).
+FROM digamberjhazaran/infinitetalk-runpod:v19
+
+SHELL ["/bin/bash", "-c"]
+
+# 1. Baseline freeze + fingerprints of the files this image must NOT change
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
+    sha256sum /handler.py /entrypoint.sh /setup_models.py /I2V_single.json /I2V_multi.json /V2V_single.json /V2V_multi.json > /tmp/unchanged.sha256
+
+# 2. New worker_guard (whole folder replaced) + compiled workflow copies
+RUN rm -rf /worker_guard
+COPY worker_guard/ /worker_guard/
+COPY I2V_single_compiled.json I2V_multi_compiled.json /
+COPY scripts/verify_wrapper_contract.py /tmp/verify_wrapper_contract.py
+RUN find /worker_guard -name '*.py' -exec sed -i 's/\r$//' {} + && \
+    cd / && PYTHONPATH=/ python /tmp/verify_wrapper_contract.py /ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper \
+        /I2V_single.json=/I2V_single_compiled.json /I2V_multi.json=/I2V_multi_compiled.json && \
+    grep -q "install_job_guard(handler, get_videos)" /handler.py && \
+    python -c "import worker_guard.job_guard, worker_guard.accel, worker_guard.speed, worker_guard.offload, setup_models; from worker_guard import accel, offload; print('worker_guard import OK; compiled additions:', accel.compiled_additions('image', 'single')[1], accel.compiled_additions('image', 'multi')[1]); print('tiers:', offload.load_tiers())" && \
+    rm -f /tmp/verify_wrapper_contract.py
+
+# 3. LAST RUN STEP: unchanged files + zero package drift
+RUN sha256sum -c /tmp/unchanged.sha256 && \
+    /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "❌ CRITICAL ERROR: files or the ComfyUI Python environment changed during the v20 build!"; \
+        exit 1; \
+    } && \
+    rm -f /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt /tmp/unchanged.sha256 && \
+    echo "✅ handler/entrypoint/setup_models/original workflows unchanged. Zero package drift."

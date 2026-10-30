@@ -1,0 +1,103 @@
+# ==============================================================================
+# Dockerfile.tts - Isolated Chatterbox TTS Layer for RunPod Serverless Worker
+# ==============================================================================
+# BASE_IMAGE must be passed explicitly via --build-arg BASE_IMAGE=<image:tag>
+# Example: docker build -f Dockerfile.tts --build-arg BASE_IMAGE=my-comfy-worker:prod ...
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-c"]
+
+# Build Arguments (No default for TORCH_CUDA_INDEX_URL to force explicit selection)
+ARG TORCH_CUDA_INDEX_URL
+ARG TARGET_GPU_ARCH=""
+ARG TORCH_VERSION="2.6.0"
+ARG TORCHAUDIO_VERSION="2.6.0"
+ARG CHATTERBOX_VERSION="0.1.7"
+# chatterbox-tts 0.1.7 ChatterboxMultilingualTTS.from_local(ckpt_dir, device) hard-codes this T3 file (mtl_tts.py:179)
+ARG TTS_MODEL="t3_mtl23ls_v2.safetensors"
+# Hugging Face weights pinned to an exact commit (public repo, no token needed)
+ARG HF_REPO_ID="ResembleAI/chatterbox"
+ARG HF_REVISION="5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18"
+
+# Validate that required build args are provided
+RUN if [ -z "$TORCH_CUDA_INDEX_URL" ]; then \
+        echo "❌ Build Error: TORCH_CUDA_INDEX_URL must be explicitly provided (e.g., https://download.pytorch.org/whl/cu121 or cu124)." && exit 1; \
+    fi
+
+# 1. Baseline freeze of the existing ComfyUI Python environment
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt
+
+# 2. Create isolated virtual environment strictly in /opt/tts-venv
+RUN /usr/bin/python3.10 -m venv /opt/tts-venv && \
+    /opt/tts-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# 3. Install pinned torch and torchaudio into /opt/tts-venv using the specified CUDA index URL
+RUN /opt/tts-venv/bin/pip install --no-cache-dir \
+        "torch==${TORCH_VERSION}" \
+        "torchaudio==${TORCHAUDIO_VERSION}" \
+        --index-url "${TORCH_CUDA_INDEX_URL}"
+
+RUN TARGET_GPU_ARCH="${TARGET_GPU_ARCH}" /opt/tts-venv/bin/python -c 'import os, sys, torch; target = os.environ.get("TARGET_GPU_ARCH", "").strip(); arches = torch.cuda.get_arch_list() or (torch._C._cuda_getArchFlags().split() if hasattr(torch._C, "_cuda_getArchFlags") else []); print("Verified PyTorch:", torch.__version__, "| CUDA available in build:", torch.cuda.is_available(), "| Arch list:", arches); sys.exit(f"❌ Target GPU architecture {target} is not supported by PyTorch build arches: {arches}") if (target and not any(target in a for a in arches)) else None'
+
+# 4. Write constraints file pinning exact torch and torchaudio versions
+RUN printf "torch==%s\ntorchaudio==%s\n" "${TORCH_VERSION}" "${TORCHAUDIO_VERSION}" > /tmp/tts_constraints.txt
+
+# 5. Install pinned Chatterbox using -c constraints.txt so dependencies install but torch cannot change
+RUN /opt/tts-venv/bin/pip install --no-cache-dir \
+        "chatterbox-tts==${CHATTERBOX_VERSION}" \
+        -c /tmp/tts_constraints.txt
+
+# 6. Pre-download weights into /opt/tts-models for offline inference (runtime uses HF_HUB_OFFLINE=1 in the TTS subprocess).
+#    Fails the build if TTS_MODEL is not the file the installed chatterbox actually loads, or if any weight
+#    file's sha256 differs from the pinned commit (LFS sha256 values from the Hugging Face tree API).
+ENV TTS_MODEL=${TTS_MODEL}
+RUN /opt/tts-venv/bin/python -c "\
+import inspect, chatterbox.mtl_tts as m; \
+src = inspect.getsource(m.ChatterboxMultilingualTTS.from_local); \
+assert '${TTS_MODEL}' in src, 'installed chatterbox from_local() does not load ${TTS_MODEL}'; \
+print('Verified: installed chatterbox from_local() loads ${TTS_MODEL}')" && \
+    mkdir -p /opt/tts-models && \
+    /opt/tts-venv/bin/python -c "\
+from huggingface_hub import snapshot_download; \
+print('Downloading ${TTS_MODEL} from ${HF_REPO_ID}@${HF_REVISION} to /opt/tts-models'); \
+snapshot_download( \
+    repo_id='${HF_REPO_ID}', \
+    revision='${HF_REVISION}', \
+    local_dir='/opt/tts-models', \
+    allow_patterns=['ve.pt', '${TTS_MODEL}', 's3gen.pt', 'grapheme_mtl_merged_expanded_v1.json', 'conds.pt', 'Cangjie5_TC.json'] \
+)" && \
+    cd /opt/tts-models && \
+    printf '%s\n' \
+        "4b16d836bc598509860f6fa068165a8bb5e9ac84f05582dfcf278a5a372879f1  ve.pt" \
+        "b1237586127ce98e7800a68e49938eb5092846862aabcb6e17b2fda7889a6c75  t3_mtl23ls_v2.safetensors" \
+        "9b9ff07e60b20c136e2b1b3d7563a24604e8d2c4c267888d1ee929dd0151d2a3  s3gen.pt" \
+        "6552d70568833628ba019c6b03459e77fe71ca197d5c560cef9411bee9d87f4e  conds.pt" \
+    | sha256sum -c - && \
+    test -f grapheme_mtl_merged_expanded_v1.json
+
+# 7. Copy TTS handler & runner modules into /tts, then patch the base image's OWN /handler.py
+#    (the local handler.py is never copied). Build fails if the anchor matches 0 or >1 times,
+#    if the block is already present, or if the diff is anything other than the 4 added lines.
+COPY tts/ /tts/
+COPY scripts/patch_handler_tts.py /tmp/patch_handler_tts.py
+RUN cp /handler.py /tmp/handler.py.orig && \
+    /usr/bin/python3.10 /tmp/patch_handler_tts.py /handler.py && \
+    echo "=== /handler.py diff (expect exactly 4 added lines) ===" && \
+    { diff -u /tmp/handler.py.orig /handler.py; rc=$?; [ "$rc" -eq 1 ] || { echo "❌ Patch produced no diff or diff failed (rc=$rc)"; exit 1; }; } && \
+    rm -f /tmp/patch_handler_tts.py /tmp/handler.py.orig
+
+# 8. Clean up temporary build artifacts
+RUN rm -f /tmp/tts_constraints.txt
+
+# 9. LAST RUN STEP: Freeze verification diff
+# Ensures zero packages or versions in the ComfyUI Python environment were modified, added, or removed
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "❌ CRITICAL ERROR: ComfyUI Python environment was modified during Chatterbox installation!"; \
+        diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt; \
+        exit 1; \
+    } && \
+    echo "✅ ComfyUI Python environment verified untouched. Zero drift detected."
+
+CMD ["/entrypoint.sh"]

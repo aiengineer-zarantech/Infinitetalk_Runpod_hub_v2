@@ -1,0 +1,3 @@
+FROM digamberjhazaran/infinitetalk-runpod:v15
+RUN /opt/tts-venv/bin/pip install --no-cache-dir "setuptools<70"
+COPY tts/ /tts/

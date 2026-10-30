@@ -1,0 +1,12 @@
+{
+  "input": {
+    "task": "tts",
+    "text": "Hello, this is a test of the isolated Chatterbox voice cloning system on RunPod.",
+    "language_id": "en",
+    "temperature": 0.8,
+    "cfg_weight": 0.5,
+    "exaggeration": 0.5,
+    "seed": 42,
+    "reference_audio_base64": "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA="
+  }
+}

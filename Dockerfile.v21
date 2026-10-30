@@ -1,0 +1,33 @@
+# ==============================================================================
+# Dockerfile.v21 - Offloading OFF by default on top of v20
+# ==============================================================================
+# blocks_to_swap 0 / force_offload False, except 720p below 44 GB (25 blocks, force_offload True);
+# MIN_VRAM_GB 28 (startup + per job); one emergency swap retry after OOM (0 -> 6, else +10, max 40).
+# Also contains the speed.py fix (model-loading progress ignored). Replaces only /worker_guard;
+# handler, entrypoint, setup_models and all six workflow files are inherited from v20 (checked).
+# Installs nothing (pip freeze checked).
+FROM digamberjhazaran/infinitetalk-runpod:v20
+
+SHELL ["/bin/bash", "-c"]
+
+# 1. Baseline freeze + fingerprints of the files this image must NOT change
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
+    sha256sum /handler.py /entrypoint.sh /setup_models.py /I2V_single.json /I2V_multi.json /V2V_single.json /V2V_multi.json \
+        /I2V_single_compiled.json /I2V_multi_compiled.json > /tmp/unchanged.sha256
+
+# 2. New worker_guard (whole folder replaced so no stale module survives)
+RUN rm -rf /worker_guard
+COPY worker_guard/ /worker_guard/
+RUN find /worker_guard -name '*.py' -exec sed -i 's/\r$//' {} + && \
+    grep -q "install_job_guard(handler, get_videos)" /handler.py && \
+    cd / && python -c "import worker_guard.job_guard, worker_guard.accel, worker_guard.speed, setup_models; from worker_guard import offload; print('worker_guard import OK; tiers:', offload.load_tiers(), 'MIN_VRAM_GB:', offload.min_vram_gb(), 'emergency:', offload.emergency_settings(0), 'manual allowed:', offload.manual_allowed())"
+
+# 3. LAST RUN STEP: unchanged files + zero package drift
+RUN sha256sum -c /tmp/unchanged.sha256 && \
+    /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "❌ CRITICAL ERROR: files or the ComfyUI Python environment changed during the v21 build!"; \
+        exit 1; \
+    } && \
+    rm -f /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt /tmp/unchanged.sha256 && \
+    echo "✅ handler/entrypoint/setup_models/all workflows unchanged. Zero package drift."

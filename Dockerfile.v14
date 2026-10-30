@@ -1,0 +1,2 @@
+FROM digamberjhazaran/infinitetalk-runpod:v13
+COPY tts/ /tts/

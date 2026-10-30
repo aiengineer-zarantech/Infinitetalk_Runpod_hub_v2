@@ -23,3 +23,12 @@ Thumbs.db
 ul_infi2.py
 *.log
 
+
+# Media outputs, logs and large benchmark payloads (rebuild with scripts/make_step2_payloads.py)
+*.mp4
+*.wav
+outputs/
+logs/
+payloads/step2/step2b_repro_720p.json
+payloads/step2/step2c_vae_tiling_720p.json
+payloads/step2/step2d_measure_25_blocks.json

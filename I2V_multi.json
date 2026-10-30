@@ -11,7 +11,7 @@
   "122": {
     "inputs": {
       "model": "Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors",
-      "base_precision": "fp16_fast",
+      "base_precision": "bf16",
       "quantization": "fp8_e4m3fn",
       "load_device": "offload_device",
       "attention_mode": "sageattn",
@@ -140,9 +140,9 @@
   },
   "134": {
     "inputs": {
-      "blocks_to_swap": 20,
-      "offload_img_emb": false,
-      "offload_txt_emb": false,
+      "blocks_to_swap": 38,
+      "offload_img_emb": true,
+      "offload_txt_emb": true,
       "use_non_blocking": true,
       "vace_blocks_to_swap": 0,
       "prefetch_blocks": 1,
@@ -168,7 +168,7 @@
     "inputs": {
       "lora": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
       "strength": 1,
-      "low_mem_load": false,
+      "low_mem_load": true,
       "merge_loras": false
     },
     "class_type": "WanVideoLoraSelect",

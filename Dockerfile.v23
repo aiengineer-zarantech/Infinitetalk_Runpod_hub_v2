@@ -1,0 +1,57 @@
+# ==============================================================================
+# Dockerfile.v23 - offload fail-safe on top of v22
+# ==============================================================================
+# 480p on GPUs >= 28 GB always queues blocks_to_swap 0 / force_offload False / main_device, whatever the
+# client, manual mode or OFFLOAD_TIERS say (only the emergency OOM retry may change it). handler.queue_prompt
+# checks the final workflow right before /prompt (also with WORKER_GUARD_ENABLED=0), logs
+# "[OFFLOAD] final: ..." and fixes a mismatch with an error. Opt-in "vae_tiling" job input for TESTING.md step 2c.
+# 720p on 28-44 GB unchanged (25 blocks, force_offload True) until measured.
+# Replaces /worker_guard and /handler.py (v22's /handler.py is checked to be the exact file it was made from).
+# entrypoint, setup_models, all six workflow files and every custom node file are inherited from v22 (checked).
+# Installs nothing (pip freeze checked).
+FROM digamberjhazaran/infinitetalk-runpod:v22
+
+SHELL ["/bin/bash", "-c"]
+
+# 1. Baseline freeze + fingerprints of the files this image must NOT change; v22 handler is the expected one
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
+    echo "5534acefa8ad762873b273051ee2dcbccea29a7e8bd2f6721757558accb15b8c  /handler.py" | sha256sum -c --quiet && \
+    sha256sum /entrypoint.sh /setup_models.py /I2V_single.json /I2V_multi.json /V2V_single.json /V2V_multi.json \
+        /I2V_single_compiled.json /I2V_multi_compiled.json > /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes.sha256
+
+# 2. New worker_guard (whole folder replaced so no stale module survives) + handler
+RUN rm -rf /worker_guard
+COPY worker_guard/ /worker_guard/
+COPY handler.py /handler.py
+RUN find /worker_guard -name '*.py' -exec sed -i 's/\r$//' {} + && rm -rf /worker_guard/__pycache__ && \
+    grep -q "install_job_guard(handler, get_videos)" /handler.py && \
+    grep -q "final_offload_check(prompt)" /handler.py && \
+    /usr/bin/python3.10 -m py_compile /handler.py && rm -rf /__pycache__ && \
+    cd / && python -c "import worker_guard.job_guard, worker_guard.node_timer, worker_guard.accel, worker_guard.speed, setup_models; print('worker_guard import OK')"
+
+# 3. Smoke check on the real workflow files (CPU, no ComfyUI): 480p with 38 / True is fixed to 0 / False,
+#    720p on 31.4 GB keeps 25 / True, the OOM retry may swap. Nothing is written.
+RUN cd / && PYTHONDONTWRITEBYTECODE=1 python -c "\
+import json; from worker_guard import offload as o; \
+w = lambda f, wd, ht: (lambda p: (p['245']['inputs'].update(value=wd), p['246']['inputs'].update(value=ht), p)[2])(json.load(open(f, encoding='utf-8'))); \
+p = w('/I2V_single.json', 854, 480); assert p['134']['inputs']['blocks_to_swap'] == 38; \
+assert o.enforce_final(p, 31.4) == (0, False) and p['122']['inputs']['load_device'] == 'main_device'; \
+p = w('/V2V_single.json', 854, 480); assert o.enforce_final(p, 31.4) == (0, False); \
+d, _ = o.decide({'width': 854, 'height': 480, 'offload_mode': 'manual', 'blocks_to_swap': 38}, 31.4 * 1024 ** 3); \
+assert (d.blocks_to_swap, d.force_offload) == (0, False); \
+d, _ = o.decide({'width': 1280, 'height': 720}, 31.4 * 1024 ** 3); assert (d.blocks_to_swap, d.force_offload) == (25, True); \
+p = w('/I2V_single.json', 854, 480); o._set_offload(p, 6, False); assert o.enforce_final(p, 31.4, (6, False), True) == (6, False); \
+print('OK: offload fail-safe smoke check')"
+
+# 4. LAST RUN STEP: unchanged files + unchanged custom nodes + zero package drift
+RUN sha256sum -c --quiet /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes_post.sha256 && \
+    diff -u /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
+    /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "CRITICAL ERROR: files, custom nodes or the ComfyUI Python environment changed during the v23 build!"; \
+        exit 1; \
+    } && \
+    rm -f /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt /tmp/unchanged.sha256 /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
+    echo "OK: entrypoint/setup_models/all workflows/custom nodes unchanged. Zero package drift."

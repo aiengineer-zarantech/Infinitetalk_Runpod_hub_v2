@@ -1,0 +1,5 @@
+{
+ "input": {
+  "cmd": "cd /ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper && echo '== wrapper commit' && git log -1 --format='%h %ci %s' 2>&1; python3 -c \"import json, urllib.request\nfor n in ('WanVideoImageToVideoMultiTalk', 'WanVideoDecode', 'WanVideoEncode', 'WanVideoVAELoader', 'WanVideoSampler'):\n    d = json.load(urllib.request.urlopen('http://127.0.0.1:8188/object_info/' + n, timeout=30)).get(n, {})\n    print('== ' + n + (' (NOT INSTALLED)' if not d else ''))\n    for kind in ('required', 'optional'):\n        for k, v in d.get('input', {}).get(kind, {}).items():\n            print('   ', kind, k, json.dumps(v)[:200])\n\" 2>&1; echo '== tiled_vae in wrapper source'; grep -rn --include=*.py 'tiled_vae' . | head -60; echo '== vae.decode / vae.encode calls'; grep -rn --include=*.py -E 'vae\\.(decode|encode)\\(' . | head -60"
+ }
+}
