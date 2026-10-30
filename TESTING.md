@@ -253,3 +253,149 @@ blocks    = ceil((peak_at_0 + 2 - 31.4) / 0.38), at least 0
 ```
 
 Example: X = 22.0 GB gives peak_at_0 = 31.5 GB and blocks = ceil(2.1 / 0.38) = 6.
+
+## Phase A (v24): full GPU for 480p and fast480, resident model, 720p calibration, OOM ladder
+
+Branch `feature/fast480-upscale`. Old jobs are unchanged: `tests/test_v23_prompt_identity.py` runs the same jobs
+(what the studio sends today, plus 720p, V2V, multi, compile off, FP8_FAST, benchmark, manual, VAE tiling) through
+the handler and worker_guard of `v1.0-stable` and of v24 and checks that every workflow sent to ComfyUI and every
+result is identical. New behaviour only starts with the new `"mode": "fast480"` input, an OOM, or the env switches below.
+
+### Endpoint
+
+- Image: `digamberjhazaran/infinitetalk-runpod:v24`, digest `DIGEST_V24`
+- GPU: RTX 5090 (31.4 GB). Use a test endpoint, not production. Max workers 1 for A.3 (both jobs must reach the same warm worker).
+- **Execution timeout: 3900 s** (endpoint settings, Execution Timeout), and env **`RUNPOD_EXECUTION_TIMEOUT_SEC=3900`**
+  with the same number. RunPod does not tell the worker its timeout, so the worker needs the env to know it.
+  Check the endpoint's current value: I believe the RunPod default is 600 s, far too short for long 720p jobs.
+  With `JOB_TIMEOUT_SEC` at its default 3600, the worker stops a job itself at 3600 s with a clear error, 300 s
+  before RunPod would kill it. The worker uses the smaller of `JOB_TIMEOUT_SEC` and
+  `RUNPOD_EXECUTION_TIMEOUT_SEC - 120` (`RUNPOD_RETURN_MARGIN_SEC`: time to encode and return the video).
+  Without the env the worker logs `[GUARD] RUNPOD_EXECUTION_TIMEOUT_SEC not set: ...` at startup.
+- Env for A.4: `OFFLOAD_ALLOW_MANUAL=1`. Optional for A.4: `PROFILE=1` (per-window times; adds GPU syncs).
+- Env for A.5 only: see A.5. Remove it afterwards.
+
+### Payloads
+
+All in `payloads\phaseA\` (git-ignored: they contain the image and audio as base64). Same image, audio and prompt
+as the A/B benchmark. Every job is a benchmark job, so the worker cuts the audio to 10 s (4 windows). The seed is the
+workflow's fixed 2. Rebuild:
+
+```powershell
+python scripts\make_fast480_payloads.py --from ..\.baselines\bench\bench_compile_off.json
+```
+
+Run each one with:
+
+```powershell
+$env:RUNPOD_API_KEY = "<your key>"   # in your own shell only, never in files
+.\scripts\run_runpod_job.ps1 -EndpointId <test-endpoint-id> -Payload payloads\phaseA\a2_fast480_16x9.json -Out a2_fast480_16x9.json
+```
+
+| File | Input (besides image, audio, prompt, `"benchmark": true`) |
+|---|---|
+| `a2_normal_480p.json` | `"width": 854, "height": 480` |
+| `a2_fast480_16x9.json` | `"mode": "fast480"` (848x480) |
+| `a2_fast480_9x16.json` | `"mode": "fast480", "aspect": "9:16"` (480x848) |
+| `a4_720p_b0_tiling_off.json`, `a4_720p_b5_tiling_off.json`, `a4_720p_b10_tiling_off.json` | `"width": 1280, "height": 720, "offload_mode": "manual", "blocks_to_swap": 0 / 5 / 10, "force_offload": false, "vae_tiling": false` |
+| `a4_720p_b0_tiling_on.json`, `a4_720p_b5_tiling_on.json`, `a4_720p_b10_tiling_on.json` | same with `"vae_tiling": true` |
+| `a5_ladder_720p.json` | `"width": 1280, "height": 720` (auto mode) |
+
+### A.2: 480p and fast480 run fully on the GPU
+
+Run `a2_normal_480p.json`, `a2_fast480_16x9.json`, `a2_fast480_9x16.json`.
+
+| Line | What to check |
+|---|---|
+| `[OFFLOAD] auto: VRAM 31.4 GB, 848x480 -> blocks_to_swap 0, force_offload False` | Decision (854x480 / 480x848 for the others) |
+| `[OFFLOAD] final: blocks_to_swap 0, force_offload False, node 134 {'blocks_to_swap': 0, 'offload_img_emb': False, 'offload_txt_emb': False}, load_device main_device` | **The proof**: exactly what ComfyUI received |
+| `[MODE] fast480: width/height ... replaced by 848x480` | Only if the client sent another size |
+| `[VRAM] vram peak sampler X GB, vae Y GB, headroom Z GB (...)` | Per-stage peaks |
+| `[JOB] fast480 done: res 848x480, gen Xs, upscale n/a, total Zs, attention sageattn, blocks_to_swap 0, vram peak sampler A GB / vae B GB / upscale n/a` | Final line. `upscale` stays `n/a` until Phase D |
+
+The 9:16 output must be 480x848 with the face center-cropped, not stretched (the workflow's ImageResizeKJv2 node
+crops to the target size from the center).
+
+### A.3: the model stays in VRAM between jobs
+
+Right after A.2, on the same warm worker, run `a2_fast480_16x9.json` once more.
+
+| Line | What to check |
+|---|---|
+| `[RESIDENT] video job #N on this worker: model loader 122 reused from VRAM (cached); VRAM used at job start X GB` | **The proof**: ComfyUI reused the loaded model. X should be well above 1 GB (the model is already on the GPU) |
+| `[RESIDENT] ... model loader 122 loaded` | First job on a worker, or the model settings changed |
+| `[RESIDENT] model settings changed (nodes ...); unloading the previous model before queueing` | A job needs another model (blocks_to_swap, compile setting, later the attention mode). The old one is unloaded first so two copies never share the VRAM |
+
+The time before the first `[SPEED] window 1/4` line should also be much shorter on the second run.
+
+### A.4: 720p at blocks_to_swap 0, 5 and 10 (calibration)
+
+Env `OFFLOAD_ALLOW_MANUAL=1`. Order (smallest risk first): `b10_tiling_off`, `b5_tiling_off`, `b0_tiling_off`,
+`b10_tiling_on`, `b5_tiling_on`, `b0_tiling_on`. Manual jobs get no OOM ladder, so an OOM is reported, not hidden.
+Production 720p runs without VAE tiling, so the tiling-off numbers are the ones the default is based on.
+
+Send me, for each job:
+
+| Line | Why |
+|---|---|
+| `[OFFLOAD] manual: blocks_to_swap N, force_offload False (as sent)` and `[OFFLOAD] final: ...` | The job really ran with N |
+| `[comfy] Transformer blocks on cpu: X MB` (in the "Block swap memory summary"; b5 and b10 only) | **Exact size of one block** = X / N. Replaces the 0.44 GB estimate |
+| `[VRAM] vram peak sampler X GB, vae Y GB, headroom Z GB` | Peaks per stage at N |
+| `[SPEED] window k/4: ...` and `[JOB] standard done: ...` | Speed cost of swapping |
+| On failure: `ComfyUI execution_error at node 128 ...` and the traceback's last 10 lines | Where 0 blocks runs out of memory |
+
+From these I fit the adaptive calibration (block size, sampler and VAE peak per resolution) and set the 720p
+default to the lowest blocks_to_swap with at least 2 GB headroom (never 25 unless measured). That goes into the
+next image; until then 720p on 28-44 GB stays at 25 / True. A calibration can also be tried without a rebuild:
+`OFFLOAD_CALIBRATION={"block_gb": B, "sampler": {"base_gb": a, "gb_per_ktoken": b}, "vae": {"base_gb": c, "gb_per_ktoken": d}}`.
+
+### A.5: OOM ladder, failing stage, RAM
+
+Only meaningful if `b0_tiling_off` ran out of memory in A.4. Set this env on the test endpoint (720p then starts at
+0 blocks in auto mode; the 480p rule is not affected), run `a5_ladder_720p.json`, then **remove the env**:
+
+```
+OFFLOAD_TIERS=[{"min_vram_gb": 28, "480p": {"blocks_to_swap": 0, "force_offload": false}, "720p": {"blocks_to_swap": 0, "force_offload": false}}]
+```
+
+| Line | What to check |
+|---|---|
+| `[OFFLOAD] RAM (job): limit X GB, used Y GB, available Z GB (cgroup v2); blocks_to_swap N needs ~A GB, 40 needs ~B GB (block 0.44 GB, estimate; unpinned RAM)` | Container RAM, and whether the last ladder steps (40 blocks) fit on this worker type. Logged for every video job |
+| `[OFFLOAD] RAM: OOM ladder steps above K blocks would not fit ...` (WARNING) or `[OFFLOAD] RAM too low for blocks_to_swap N ...` (ERROR) | Only when RAM is short |
+| `[OFFLOAD] OOM retry 1/4: out of memory at vae_decode (node 128 WanVideoSampler, window 3); blocks_to_swap 0 -> 10, force_offload False (~Ns needed, Ms left)` | **Failing stage** of the attempt that ran out of memory (`sampler (transformer steps, ...)` when it was the transformer) |
+| `[OFFLOAD] RAM (OOM retry k): ...` | RAM for that step |
+| `[OFFLOAD] OOM retry final: VAE tiling ON (output may differ)` | Only after the 40-block attempt also ran out of memory. The output then has `"emergency_vae_tiling": true` |
+| `[OFFLOAD] OOM retry k/4 not started: needs ~Ns (...), only Ms left before ...` | Not enough time for another attempt (estimate: windows done so far x 1.5, or 2x a failed attempt, at least `OOM_RETRY_MIN_SEC` = 120 s) |
+| `[OFFLOAD] adaptive: predicted peak n/a (not calibrated, tier value used), chosen blocks_to_swap N, actual peak Z GB (W%), budget ...` | Every job. The prediction appears once calibrated |
+
+Ladder: +10, then 25, then 40 (only values above the step before), then 40 with VAE tiling. Normal jobs never get
+VAE tiling from the worker; the old opt-in `"vae_tiling": true` job input (test input since v23) is unchanged.
+
+### A.6 (optional): allocator with expandable segments
+
+Env `ALLOC_MODE=native_expandable`: ComfyUI starts with `--disable-cuda-malloc` and
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (with ComfyUI's default cudaMallocAsync backend, torch ignores this
+option). Run `a2_fast480_16x9.json` and `a4_720p_b10_tiling_off.json` and compare with the runs above:
+
+| Line | What to check |
+|---|---|
+| `ALLOC_MODE=native_expandable: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, ComfyUI --disable-cuda-malloc (test only)` | Switch active |
+| `[comfy] Device: cuda:0 NVIDIA GeForce RTX 5090 : native` | ComfyUI uses torch's native allocator (default runs say `cudaMallocAsync`) |
+| `[VRAM] ...` and `[SPEED] ...` | Peaks and speed against the default allocator |
+| torch warning `PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead` | Expected with torch 2.9.1, harmless |
+
+Frames should be identical (the allocator does not change numerics). Check with the framemd5 commands in
+PROFILING.md section 5. If they differ, first check that two runs with the default allocator are identical.
+
+### New and changed env (all optional)
+
+| Env | Default | Meaning |
+|---|---|---|
+| `RUNPOD_EXECUTION_TIMEOUT_SEC` | unset | The endpoint's execution timeout, for the OOM ladder time check and the watchdog |
+| `RUNPOD_RETURN_MARGIN_SEC` | 120 | Kept free at the end of the RunPod limit |
+| `OOM_RETRY_MIN_SEC` | 120 | Minimum time a ladder step needs |
+| `OFFLOAD_CALIBRATION` | unset | Adaptive calibration JSON (see A.4) |
+| `OFFLOAD_TARGET_FRACTION` | 0.85 | Share of the VRAM the predicted peak may use (0.5 to 0.95) |
+| `VRAM_STAGES` / `VRAM_STAGE_INTERVAL_MS` | 1 / 50 | Per-stage VRAM sampler inside ComfyUI; 0 turns it off |
+| `ALLOC_MODE` | unset | `native_expandable`, test only (A.6) |
+| `OOM_EMERGENCY_BLOCKS` | removed | Replaced by the ladder |

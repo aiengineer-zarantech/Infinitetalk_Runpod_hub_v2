@@ -499,7 +499,9 @@ def test_job_line_for_video(comfy, clock, caplog, monkeypatch):
     assert job_lines(caplog) == [
         "[JOB] done in 42.0s (frames 181, resolution 512x768, gpu NVIDIA GeForce RTX 5090, vram 32.0 GB, "
         "peak 19.5 GB, blocks_to_swap 0, force_offload False, mode auto, oom_retry no, torch_compile off, "
-        "fp8_fast off, avg n/a s/it, sampling n/a)"
+        "fp8_fast off, avg n/a s/it, sampling n/a)",
+        "[JOB] standard done: res 512x768, gen 0.0s, upscale n/a, total 42.0s, attention n/a, blocks_to_swap 0, "
+        "vram peak sampler n/a / vae n/a / upscale n/a",
     ]
 
 
@@ -515,4 +517,6 @@ def test_job_line_for_tts_and_failures(comfy, clock, caplog, monkeypatch):
         "[JOB] failed in 0.0s (frames n/a, resolution n/a, gpu NVIDIA GeForce RTX 5090, vram 32.0 GB, peak 19.5 GB, "
         "blocks_to_swap 0, force_offload False, mode auto, oom_retry no, torch_compile off, fp8_fast off, "
         "avg n/a s/it, sampling n/a): audio missing",
+        "[JOB] standard failed: res n/a, gen n/a, upscale n/a, total 0.0s, attention n/a, blocks_to_swap 0, "
+        "vram peak sampler n/a / vae n/a / upscale n/a",
     ]

@@ -2,7 +2,7 @@
 # Offloading OFF by default (worker_guard/offload.py + job_guard integration):
 # blocks_to_swap 0 / force_offload False at any resolution, client values ignored,
 # MIN_VRAM_GB (28) rejection per job, manual mode only with OFFLOAD_ALLOW_MANUAL=1,
-# one emergency retry after OOM (blocks_to_swap 6, force_offload False), OFFLOAD_TIERS
+# the OOM ladder (+10, 25, 40, then 40 with VAE tiling) and its time check, OFFLOAD_TIERS
 # override, peak VRAM, and the near-zero watchdog rule when blocks are swapped.
 # ComfyUI is fully mocked.
 # ==============================================================================
@@ -272,20 +272,20 @@ def test_is_oom():
     assert not offload.is_oom(None)
 
 
-@pytest.mark.parametrize("env, current, force, expected", [
-    (None, 0, False, (6, False)),     # no offloading -> 6 blocks, force_offload stays False
-    (None, 10, False, (20, False)),   # already swapping -> 10 more
-    (None, 25, True, (35, True)),     # 720p on 32 GB -> 35, force_offload stays True
-    (None, 35, True, (40, True)),     # capped at 40
-    (None, 40, True, (40, True)),
-    ("12", 0, False, (12, False)),
-    ("99", 0, False, (40, False)),
-    ("abc", 0, False, (6, False)),
+@pytest.mark.parametrize("current, expected", [
+    (0, [(10, False), (25, False), (40, False), (40, True)]),
+    (6, [(16, False), (25, False), (40, False), (40, True)]),
+    (20, [(30, False), (40, False), (40, True)]),    # 25 is not more than 30: skipped
+    (25, [(35, False), (40, False), (40, True)]),
+    (35, [(40, False), (40, True)]),
+    (40, [(40, True)]),                               # already at 40: only the VAE tiling step is left
 ])
-def test_emergency_settings(monkeypatch, env, current, force, expected):
-    if env is not None:
-        monkeypatch.setenv("OOM_EMERGENCY_BLOCKS", env)
-    assert offload.emergency_settings(current, force) == expected
+def test_oom_ladder(current, expected):
+    steps = offload.oom_ladder(current)
+    assert steps == expected
+    # VAE tiling is always the last step and always comes right after (or at) 40 blocks
+    assert [t for _, t in steps] == [False] * (len(steps) - 1) + [True]
+    assert steps[-1] == (40, True) and (len(steps) == 1 or steps[-2] == (40, False))
 
 
 # ---------------------------------------------------------------- integration through the guard
@@ -349,61 +349,120 @@ def test_manual_job_passes_client_values_when_allowed(gpu, clock, monkeypatch, c
     assert "[OFFLOAD] manual: blocks_to_swap 40, force_offload True (as sent)" in caplog.messages
 
 
-def test_emergency_swap_after_oom_success(gpu, clock, caplog):
+def test_ladder_first_step_succeeds(gpu, clock, caplog):
     gpu.stats = device(31.4, used_mb=30000)
     gpu.after_free = device(31.4, used_mb=700)
     caplog.set_level(logging.INFO, logger="worker_guard")
     gh = guarded([oom(), {"video": "b64"}], gpu)
     res = gh({"input": {"width": 720, "height": 480}})
-    assert res == {"video": "b64"}
-    # first run without offloading, then /free, then ONE retry with 6 swapped blocks and force_offload False
-    assert gpu.events == [("run", 0, False, None), ("free", True, True), ("run", 6, False, None)]
-    assert "[OFFLOAD] emergency swap after OOM: blocks_to_swap 0 -> 6, force_offload False" in caplog.messages
+    assert res == {"video": "b64"}  # no emergency_vae_tiling key: tiling never ran
+    # first run without offloading, then /free, then the first ladder step: 10 swapped blocks
+    assert gpu.events == [("run", 0, False, None), ("free", True, True), ("run", 10, False, None)]
+    assert any(m.startswith("[OFFLOAD] OOM retry 1/4: out of memory at sampler (transformer steps, node 128 "
+                            "WanVideoSampler, window n/a); blocks_to_swap 0 -> 10, force_offload False")
+               for m in caplog.messages)
     assert "[OFFLOAD] /free done: VRAM used 0.7 GB" in caplog.messages
-    job_line = [m for m in caplog.messages if m.startswith("[JOB]")][0]
-    assert job_line.startswith("[JOB] done in ")
-    assert "blocks_to_swap 6, force_offload False, mode auto, oom_retry yes" in job_line
+    assert not any("VAE tiling" in m for m in caplog.messages)
+    job_line = [m for m in caplog.messages if m.startswith("[JOB] done in ")][0]
+    assert "blocks_to_swap 10, force_offload False, mode auto, oom_retry yes" in job_line
 
 
-def test_emergency_swap_at_720p_on_32gb_adds_10_blocks(gpu, clock, caplog):
+def test_ladder_at_720p_on_32gb_goes_25_35(gpu, clock, caplog):
     caplog.set_level(logging.INFO, logger="worker_guard")
     gh = guarded([oom(), {"video": "b64"}], gpu)
     assert gh({"input": {"width": 1280, "height": 720}}) == {"video": "b64"}
-    assert gpu.events[0] == ("run", 25, True, None) and gpu.events[-1] == ("run", 35, True, None)
-    assert "[OFFLOAD] emergency swap after OOM: blocks_to_swap 25 -> 35, force_offload True" in caplog.messages
+    assert runs(gpu) == [(25, True, None), (35, True, None)]
+    assert any(m.startswith("[OFFLOAD] OOM retry 1/3: out of memory at sampler") and "blocks_to_swap 25 -> 35, "
+               "force_offload True" in m for m in caplog.messages)
 
 
-def test_emergency_swap_also_for_vae_decode_oom(gpu, clock):
+def test_ladder_also_for_vae_decode_oom(gpu, clock, caplog):
+    caplog.set_level(logging.INFO, logger="worker_guard")
     gh = guarded([oom(node_type="WanVideoDecode"), {"video": "b64"}], gpu)
     assert gh({"input": {}}) == {"video": "b64"}
-    assert runs(gpu) == [(0, False, None), (6, False, None)]
+    assert runs(gpu) == [(0, False, None), (10, False, None)]
+    assert any("out of memory at vae_decode (node 128 WanVideoDecode)" in m for m in caplog.messages)
 
 
-def test_emergency_swap_failure_returns_error_as_today(gpu, clock):
-    gh = guarded([oom(), oom()], gpu)
+def test_ladder_walks_every_step_then_vae_tiling(gpu, clock, caplog):
+    caplog.set_level(logging.INFO, logger="worker_guard")
+    seen_tiling = []
+
+    def inner(job):
+        inp = job["input"]
+        seen_tiling.append(inp.get("vae_tiling", False))
+        gpu.events.append(("run", inp.get("blocks_to_swap"), inp.get("force_offload"), inp.get("load_device")))
+        return results.pop(0)
+
+    results = [oom(), oom(), oom(), oom(), {"video": "b64"}]
+    gh, _ = job_guard.install(inner, lambda *a, **k: {})
+    res = gh({"input": {"width": 720, "height": 480}})
+    assert runs(gpu) == [(0, False, None), (10, False, None), (25, False, None), (40, False, None), (40, False, None)]
+    # VAE tiling only on the very last attempt, after the 40-block attempt also ran out of memory
+    assert seen_tiling == [False, False, False, False, True]
+    assert res == {"video": "b64", "emergency_vae_tiling": True}
+    assert "[OFFLOAD] OOM retry final: VAE tiling ON (output may differ)" in caplog.messages
+    final = caplog.messages.index("[OFFLOAD] OOM retry final: VAE tiling ON (output may differ)")
+    assert any("[OFFLOAD] OOM retry 3/4" in m for m in caplog.messages[:final])
+
+
+def test_ladder_failure_after_every_step(gpu, clock):
+    gh = guarded([oom(), oom(), oom(), oom()], gpu)
     res = gh({"input": {"width": 1280, "height": 720}})
-    assert runs(gpu) == [(25, True, None), (35, True, None)]
+    assert runs(gpu) == [(25, True, None), (35, True, None), (40, True, None), (40, True, None)]
     assert res["refresh_worker"] is True
+    assert res["emergency_vae_tiling"] is True
     assert res["error"].startswith(
         "[OFFLOAD] out of memory again after OOM retry: GPU NVIDIA GeForce RTX 5090, VRAM 31.4 GB, "
-        "1280x720, frames n/a, blocks_to_swap 35, force_offload True"
+        "1280x720, frames n/a, blocks_to_swap 40, force_offload True; ladder 25 -> 35 -> 40 -> 40 (VAE tiling)"
     )
     assert res["offload"] == {"gpu": "NVIDIA GeForce RTX 5090", "vram_gb": 31.4, "width": 1280, "height": 720,
-                              "frames": None, "blocks_to_swap": 35, "force_offload": True, "mode": "auto",
+                              "frames": None, "blocks_to_swap": 40, "force_offload": True, "mode": "auto",
                               "oom_retry": True}
     assert res["details"]["exception_type"] == "torch.OutOfMemoryError"
 
 
-def test_retry_failing_with_other_error_still_reports(gpu, clock):
-    res = guarded([oom(), {"error": "FileNotFoundError: x"}], gpu)({"input": {}})
+def test_retry_failing_with_other_error_stops_the_ladder(gpu, clock):
+    res = guarded([oom(), {"error": "FileNotFoundError: x"}, {"video": "never"}], gpu)({"input": {}})
+    assert len(runs(gpu)) == 2
     assert res["error"].startswith("[OFFLOAD] failed again after OOM retry")
     assert res["error"].endswith("| ComfyUI: FileNotFoundError: x")
+    assert res["refresh_worker"] is True and "emergency_vae_tiling" not in res
+
+
+def test_ladder_stops_at_success(gpu, clock):
+    guarded([oom(), oom(), {"video": "b64"}, {"video": "never"}], gpu)({"input": {}})
+    assert runs(gpu) == [(0, False, None), (10, False, None), (25, False, None)]
+
+
+@pytest.mark.parametrize("env, expected_limit", [
+    ({"JOB_TIMEOUT_SEC": "100"}, "JOB_TIMEOUT_SEC=100s"),
+    ({"RUNPOD_EXECUTION_TIMEOUT_SEC": "200"}, "RUNPOD_EXECUTION_TIMEOUT_SEC=200s minus 120s to return the video"),
+])
+def test_ladder_not_started_without_time(gpu, clock, caplog, monkeypatch, env, expected_limit):
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    caplog.set_level(logging.INFO, logger="worker_guard")
+    res = guarded([oom(), {"video": "never"}], gpu)({"input": {}})
+    assert len(runs(gpu)) == 1  # the retry needs OOM_RETRY_MIN_SEC (120s) at least; under 120s are left
+    assert f"before {expected_limit}" in res["error"]
+    assert "OOM retry 1/4 not started: needs ~120s" in res["error"]
     assert res["refresh_worker"] is True
 
 
-def test_retry_happens_only_once(gpu, clock):
-    guarded([oom(), oom(), {"video": "never"}], gpu)({"input": {}})
-    assert len(runs(gpu)) == 2
+def test_ladder_time_check_runs_before_every_step(gpu, clock, monkeypatch):
+    monkeypatch.setenv("JOB_TIMEOUT_SEC", "400")
+
+    def inner(job):
+        gpu.events.append(("run", job["input"].get("blocks_to_swap"), None, None))
+        clock.t += 100  # every attempt takes 100 s: a retry is estimated at 2 x 100 + 30 (free wait)
+        return oom()
+
+    gh, _ = job_guard.install(inner, lambda *a, **k: {})
+    res = gh({"input": {}})
+    # 0 s: run 1 (ends at 100); 300 s left >= 230 -> run 2 (ends at 200); 200 s left < 230 -> stop
+    assert [e[1] for e in gpu.events if e[0] == "run"] == [0, 10]
+    assert "OOM retry 2/4 not started: needs ~230s" in res["error"]
 
 
 def test_no_retry_for_manual_mode(gpu, clock, monkeypatch):

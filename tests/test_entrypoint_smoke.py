@@ -108,6 +108,33 @@ def test_happy_path_order_and_logs(run):
     assert f"HANDLER STARTED cwd=" in out
 
 
+def comfy_args(out):
+    start = index(out, "[comfy] COMFY STUB STARTED")
+    return out[start:out.index("\n", start)].rstrip()
+
+
+def test_default_comfy_command_is_unchanged(run):
+    rc, out, _ = run()
+    assert rc == 0, out
+    assert comfy_args(out).endswith(" --use-sage-attention")  # nothing added after it
+    assert "ALLOC_MODE" not in out
+
+
+def test_alloc_mode_native_expandable(run):
+    rc, out, _ = run(ALLOC_MODE="native_expandable")
+    assert rc == 0, out
+    assert ("ALLOC_MODE=native_expandable: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, ComfyUI "
+            "--disable-cuda-malloc (test only)") in out
+    assert comfy_args(out).endswith(" --use-sage-attention --disable-cuda-malloc")
+
+
+def test_unknown_alloc_mode_is_ignored(run):
+    rc, out, _ = run(ALLOC_MODE="something")
+    assert rc == 0, out
+    assert "unknown ALLOC_MODE='something' ignored" in out
+    assert comfy_args(out).endswith(" --use-sage-attention")
+
+
 def test_gpu_failure_exits_before_copy_and_comfy(run):
     rc, out, _ = run(STUB_GPU_FAIL=1)
     assert rc == 1

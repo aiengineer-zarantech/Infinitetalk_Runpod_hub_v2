@@ -353,6 +353,13 @@ def handler(job):
         output = subprocess.getoutput(cmd)
         return {"cmd": cmd, "output": output}
 
+    # v24 job modes ("mode": "fast480" sets the size); a job without "mode" is not changed
+    from worker_guard.modes import prepare_job_input
+    job_input, mode_error = prepare_job_input(job_input)
+    if mode_error:
+        logger.error(mode_error)
+        return {"error": mode_error}
+
     # job_input을 로깅할 때 base64 데이터는 truncate해서 출력
     log_input = job_input.copy()
     for key in ["image_base64", "video_base64", "wav_base64", "wav_base64_2"]:

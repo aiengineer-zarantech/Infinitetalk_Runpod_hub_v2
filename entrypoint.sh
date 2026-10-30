@@ -27,9 +27,21 @@ COPY_PID=$!
 echo "=== Starting ComfyUI in the background ==="
 cd "$COMFY_DIR" || { echo "❌ $COMFY_DIR not found"; kill "$COPY_PID" 2>/dev/null; exit 1; }
 
+# Test-only allocator switch (default: unset = ComfyUI's cudaMallocAsync, exactly as before).
+# expandable_segments only works with torch's native allocator; ComfyUI appends backend:cudaMallocAsync
+# to PYTORCH_CUDA_ALLOC_CONF unless it is started with --disable-cuda-malloc.
+COMFY_ALLOC_ARGS=()
+if [ "${ALLOC_MODE:-}" = "native_expandable" ]; then
+    export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+    COMFY_ALLOC_ARGS=(--disable-cuda-malloc)
+    echo "ALLOC_MODE=native_expandable: PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF, ComfyUI --disable-cuda-malloc (test only)"
+elif [ -n "${ALLOC_MODE:-}" ]; then
+    echo "⚠️ unknown ALLOC_MODE='$ALLOC_MODE' ignored (supported: native_expandable)"
+fi
+
 # ComfyUI ko --extra-model-paths-config ke sath run karein (GPU only, no CPU fallback flags).
 # Output goes to comfyui.log (the handler reads its tail on errors) and to the worker log as [comfy].
-PYTHONUNBUFFERED=1 "$PYTHON_BIN" main.py --listen 127.0.0.1 --port "$COMFY_PORT" --extra-model-paths-config "$COMFY_DIR/extra_model_paths.yaml" --use-sage-attention \
+PYTHONUNBUFFERED=1 "$PYTHON_BIN" main.py --listen 127.0.0.1 --port "$COMFY_PORT" --extra-model-paths-config "$COMFY_DIR/extra_model_paths.yaml" --use-sage-attention "${COMFY_ALLOC_ARGS[@]}" \
     > >(tee "$COMFY_LOG" | sed -u 's/^/[comfy] /') 2>&1 &
 COMFY_PID=$!
 

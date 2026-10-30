@@ -124,6 +124,47 @@ def test_480p_queues_0_with_guard_disabled(posted, monkeypatch, caplog, workflow
     assert any(m.startswith("[OFFLOAD] final: blocks_to_swap 0, force_offload False") for m in caplog.messages)
 
 
+# ---------------------------------------------------------------- v24 fast480: 480p rule, proven by "[OFFLOAD] final"
+FINAL_FULL_GPU = ("[OFFLOAD] final: blocks_to_swap 0, force_offload False, node 134 {'blocks_to_swap': 0, "
+                  "'offload_img_emb': False, 'offload_txt_emb': False}, load_device main_device")
+
+
+@pytest.mark.parametrize("aspect, size", [(None, (848, 480)), ("16:9", (848, 480)), ("9:16", (480, 848))])
+@pytest.mark.parametrize("guard", ["on", "off"])
+def test_fast480_queues_full_gpu(posted, monkeypatch, caplog, aspect, size, guard):
+    extra = {"mode": "fast480", **CLIENT_38}
+    if aspect:
+        extra["aspect"] = aspect
+    caplog.set_level(logging.INFO)
+    payload = job(width=1280, height=720, **extra)  # the client's size is replaced
+    res = handler.handler(payload) if guard == "on" else run_unguarded(monkeypatch, payload)
+    assert res == {"video": base64.b64encode(VIDEO_BYTES).decode()}
+    prompt = posted[0]
+    assert (prompt["245"]["inputs"]["value"], prompt["246"]["inputs"]["value"]) == size
+    assert offload_nodes(prompt) == FULL_GPU_NODES
+    assert FINAL_FULL_GPU in caplog.messages
+    if guard == "on":
+        assert not any("Fixed before queueing" in m for m in caplog.messages)
+        assert any(m.startswith(f"[JOB] fast480 done: res {size[0]}x{size[1]}, gen ") for m in caplog.messages)
+
+
+def test_normal_480p_final_line(posted, caplog):
+    caplog.set_level(logging.INFO)
+    handler.handler(job(width=854, height=480))
+    assert FINAL_FULL_GPU in caplog.messages
+    assert any(m.startswith("[JOB] standard done: res 854x480, ") for m in caplog.messages)
+
+
+@pytest.mark.parametrize("extra", [{"input_type": "video", "mode": "fast480"}, {"mode": "fast480", "person_count": "multi"},
+                                   {"mode": "nope"}])
+@pytest.mark.parametrize("guard", ["on", "off"])
+def test_invalid_mode_is_rejected_before_queueing(posted, monkeypatch, extra, guard):
+    payload = job(**extra)
+    res = handler.handler(payload) if guard == "on" else run_unguarded(monkeypatch, payload)
+    assert res["error"].startswith("[MODE] ")
+    assert posted == []
+
+
 def test_guard_disabled_and_vram_unknown_still_queues_0(posted, monkeypatch, caplog):
     def down(timeout=10):
         raise ConnectionError("refused")

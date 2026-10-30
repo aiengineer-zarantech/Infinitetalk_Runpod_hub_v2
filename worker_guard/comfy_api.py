@@ -57,6 +57,11 @@ def free(unload_models=True, free_memory=True, timeout=10):
         response.read()
 
 
+def vram_stages(timeout=5):
+    """GET /worker/vram (zz_worker_vram package): per-stage VRAM peaks of the last prompt."""
+    return _get_json("/worker/vram", timeout)
+
+
 def object_info(node_class, timeout=30):
     return _get_json(f"/object_info/{urllib.parse.quote(node_class)}", timeout)
 

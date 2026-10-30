@@ -32,3 +32,6 @@ logs/
 payloads/step2/step2b_repro_720p.json
 payloads/step2/step2c_vae_tiling_720p.json
 payloads/step2/step2d_measure_25_blocks.json
+
+# fast480 phase payloads contain the test image and voice as base64: rebuild with scripts/make_fast480_payloads.py
+payloads/phase*/

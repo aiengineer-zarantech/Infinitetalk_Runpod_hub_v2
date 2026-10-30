@@ -1,0 +1,78 @@
+# ==============================================================================
+# Dockerfile.v24 - fast480 Phase A on top of v23 (branch feature/fast480-upscale)
+# ==============================================================================
+# - "mode": "fast480" (I2V single person, 848x480 or 480x848 with "aspect": "9:16"): 480p rule, so
+#   blocks_to_swap 0 / force_offload False / main_device on GPUs >= 28 GB
+# - Adaptive offload (OFFLOAD_CALIBRATION / OFFLOAD_TARGET_FRACTION 0.85). Not calibrated yet: the tier values
+#   are used, so no decision changes until the TESTING.md Phase A numbers are in
+# - OOM ladder: blocks_to_swap +10, 25, 40, then 40 with VAE tiling ("emergency_vae_tiling": true in the output),
+#   each step only if JOB_TIMEOUT_SEC / RUNPOD_EXECUTION_TIMEOUT_SEC leave time; RAM check incl. 40 blocks
+# - Per-stage VRAM peaks from the new /ComfyUI/custom_nodes/zz_worker_vram (defines no nodes, VRAM_STAGES=0
+#   turns it off); [VRAM], [RESIDENT], "[OFFLOAD] adaptive" and "[JOB] <mode>" lines; the old [JOB] line stays
+# - Resident model: a prompt that needs a different model unloads the old one first
+# - Test-only ALLOC_MODE=native_expandable in entrypoint.sh (unset: the ComfyUI command is exactly as before)
+# Replaces /worker_guard, /handler.py (v23 + 7 lines) and /entrypoint.sh, adds zz_worker_vram. setup_models,
+# all six workflow files and every existing custom node file are inherited from v23 (checked). Installs nothing.
+FROM digamberjhazaran/infinitetalk-runpod:v23
+
+SHELL ["/bin/bash", "-c"]
+
+# 1. Baseline freeze + fingerprints of the files this image must NOT change; v23 handler/entrypoint are the expected ones
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
+    echo "4387033a39a5f67b12e1e58a34d12c4ac0dbe3c8626d95a67e4700bfc8828488  /handler.py" | sha256sum -c --quiet && \
+    echo "0091d535031e66c02a3baa10969dede3fea23adac91e0f42a2c4ea7d1422cd90  /entrypoint.sh" | sha256sum -c --quiet && \
+    test ! -e /ComfyUI/custom_nodes/zz_worker_vram && \
+    sha256sum /setup_models.py /I2V_single.json /I2V_multi.json /V2V_single.json /V2V_multi.json \
+        /I2V_single_compiled.json /I2V_multi_compiled.json > /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes.sha256
+
+# 2. New worker_guard (whole folder replaced so no stale module survives), handler, entrypoint, VRAM stage package
+RUN rm -rf /worker_guard
+COPY worker_guard/ /worker_guard/
+COPY handler.py /handler.py
+COPY entrypoint.sh /entrypoint.sh
+COPY comfy_vram/ /ComfyUI/custom_nodes/zz_worker_vram/
+RUN find /worker_guard /ComfyUI/custom_nodes/zz_worker_vram -name '*.py' -exec sed -i 's/\r$//' {} + && \
+    sed -i 's/\r$//' /entrypoint.sh && chmod 755 /entrypoint.sh && bash -n /entrypoint.sh && \
+    grep -q 'COMFY_ALLOC_ARGS' /entrypoint.sh && \
+    rm -rf /worker_guard/__pycache__ /ComfyUI/custom_nodes/zz_worker_vram/__pycache__ && \
+    grep -q "install_job_guard(handler, get_videos)" /handler.py && \
+    grep -q "final_offload_check(prompt)" /handler.py && \
+    grep -q "prepare_job_input(job_input)" /handler.py && \
+    /usr/bin/python3.10 -m py_compile /handler.py && rm -rf /__pycache__ && \
+    cd / && python -c "import worker_guard.job_guard, worker_guard.node_timer, worker_guard.accel, worker_guard.speed, worker_guard.modes, worker_guard.sysmem, setup_models; print('worker_guard import OK')"
+
+# 3. Smoke check on the real workflow files (CPU, no ComfyUI): fast480 queues 0 / False / main_device on 31.4 GB,
+#    720p keeps 25 / True while not calibrated, the ladder ends with VAE tiling after 40. Nothing is written.
+COPY scripts/smoke_v24.py /tmp/smoke_v24.py
+RUN cd / && PYTHONDONTWRITEBYTECODE=1 python /tmp/smoke_v24.py / && rm -f /tmp/smoke_v24.py
+
+# 4. The VRAM stage package: inert with VRAM_STAGES=0, and ComfyUI (CPU, quick CI start) loads it and registers
+#    GET /worker/vram. The ComfyUI start runs on a throwaway copy in /tmp (it writes user/, input/ and a
+#    Manager cache), deleted in the same step, so the image gets nothing from it.
+RUN cd /ComfyUI/custom_nodes && VRAM_STAGES=0 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3.10 -c "\
+import sys, zz_worker_vram as p; assert p.NODE_CLASS_MAPPINGS == {} and 'zz_worker_vram.stages' not in sys.modules; \
+print('zz_worker_vram OFF with VRAM_STAGES=0: OK')" && \
+    cp -a /ComfyUI /tmp/comfy_quick_test && cd /tmp/comfy_quick_test && \
+    { env -u PROFILE PYTHONDONTWRITEBYTECODE=1 timeout 600 /usr/bin/python3.10 main.py --cpu --quick-test-for-ci \
+        > /tmp/quick_test.log 2>&1; rc=$?; } ; \
+    cd / && rm -rf /tmp/comfy_quick_test && \
+    if [ "$rc" -eq 0 ] && grep -q "\[VRAM\] per-stage VRAM peaks: GET /worker/vram" /tmp/quick_test.log && \
+       ! grep -q "\[VRAM\] not enabled" /tmp/quick_test.log; then \
+        rm -f /tmp/quick_test.log && echo "OK: ComfyUI loads zz_worker_vram"; \
+    else \
+        tail -60 /tmp/quick_test.log; echo "CRITICAL ERROR: ComfyUI did not load zz_worker_vram (exit $rc)"; exit 1; \
+    fi
+
+# 5. LAST RUN STEP: unchanged files + unchanged custom nodes (zz_worker_vram is the only new one) + zero package drift
+RUN sha256sum -c --quiet /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -not -path '/ComfyUI/custom_nodes/zz_worker_vram/*' -print0 \
+        | sort -z | xargs -0 sha256sum > /tmp/custom_nodes_post.sha256 && \
+    diff -u /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
+    /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "CRITICAL ERROR: files, custom nodes or the ComfyUI Python environment changed during the v24 build!"; \
+        exit 1; \
+    } && \
+    rm -f /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt /tmp/unchanged.sha256 /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
+    echo "OK: setup_models/all workflows/existing custom nodes unchanged. Zero package drift."

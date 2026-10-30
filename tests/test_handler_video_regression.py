@@ -150,8 +150,11 @@ def test_video_flow_logs_job_line(mocked_comfy, caplog):
     caplog.set_level(logging.INFO, logger="worker_guard")
     handler.handler(job())
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[JOB]")]
-    assert len(lines) == 1
+    assert len(lines) == 2
     assert lines[0].startswith("[JOB] done in ")
+    assert re.fullmatch(r"\[JOB\] standard done: res 512x768, gen \d+\.\ds, upscale n/a, total \d+\.\ds, "
+                        r"attention sageattn, blocks_to_swap 0, vram peak sampler n/a / vae n/a / upscale n/a",
+                        lines[1]), lines[1]
     assert re.search(
         r"\(frames 181, resolution 512x768, gpu NVIDIA GeForce RTX 5090, vram 32\.0 GB, peak 1\.0 GB, "
         r"blocks_to_swap 0, force_offload False, mode auto, oom_retry no, torch_compile on, compile ~\d+\.\ds, "
@@ -159,7 +162,13 @@ def test_video_flow_logs_job_line(mocked_comfy, caplog):
     speed = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[SPEED]")]
     assert [m.split(":")[0] for m in speed] == ["[SPEED] window 1/2", "[SPEED] window 2/2"]
     offload_lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[OFFLOAD]")]
-    assert offload_lines == ["[OFFLOAD] auto: VRAM 32.0 GB, 512x768 -> blocks_to_swap 0, force_offload False"]
+    assert offload_lines == [
+        "[OFFLOAD] auto: VRAM 32.0 GB, 512x768 -> blocks_to_swap 0, force_offload False",
+        "[OFFLOAD] RAM (job): limit 64.0 GB, used 8.0 GB, available 56.0 GB (cgroup v2); blocks_to_swap 0 needs "
+        "~0.0 GB, 40 needs ~17.6 GB (block 0.44 GB, estimate; unpinned RAM)",
+        "[OFFLOAD] adaptive: predicted peak n/a (not calibrated, tier value used), chosen blocks_to_swap 0, "
+        "actual peak 1.0 GB (3%), budget 26.2 GB (minus 1.0 GB not ours at job start)",
+    ]
 
 
 def test_network_volume_output_unchanged(mocked_comfy, monkeypatch, tmp_path):
@@ -238,7 +247,7 @@ def test_compile_failure_reruns_once_with_original_workflow(mocked_comfy, monkey
     assert [("compile_args" in p["122"]["inputs"]) for p in mocked_comfy] == [True, False]
     assert freed == [1]
     assert any(m.startswith("[COMPILE] failed: torch._dynamo.exc.BackendCompilerFailed") for m in caplog.messages)
-    assert "compile_fallback yes" in [m for m in caplog.messages if m.startswith("[JOB]")][-1]
+    assert "compile_fallback yes" in [m for m in caplog.messages if m.startswith("[JOB] done in ")][-1]
     # compile stays off on this worker afterwards
     handler.handler(job())
     assert "compile_args" not in mocked_comfy[2]["122"]["inputs"]
@@ -285,3 +294,105 @@ def test_benchmark_job_can_switch_compile_per_job(mocked_comfy):
     handler.handler(job(wav_base64=_wav_b64(3), benchmark=True, torch_compile=True))
     handler.handler(job(wav_base64=_wav_b64(3), torch_compile=False))  # ignored without benchmark
     assert [("compile_args" in p["122"]["inputs"]) for p in mocked_comfy] == [False, True, True]
+
+
+# ---------------------------------------------------------------- v24: resident model, VRAM stage line, final [JOB] line
+class CachedLoaderWs(FakeWs):
+    """ComfyUI reports the loader nodes as cached (the model stayed in VRAM since the last job)."""
+
+    def __init__(self):
+        super().__init__()
+        self.messages.insert(1, json.dumps({"type": "execution_cached",
+                                            "data": {"nodes": ["120", "122", "134", "138"], "prompt_id": "p1"}}))
+
+
+def test_second_identical_job_reuses_the_resident_model(mocked_comfy, monkeypatch, caplog):
+    import logging
+    from worker_guard import comfy_api
+    freed = []
+    monkeypatch.setattr(comfy_api, "free", lambda **k: freed.append(1))
+    caplog.set_level(logging.INFO, logger="worker_guard")
+    handler.handler(job())
+    monkeypatch.setattr(handler.websocket, "WebSocket", CachedLoaderWs)
+    handler.handler(job())
+    resident = [m for m in caplog.messages if m.startswith("[RESIDENT]")]
+    assert resident == [
+        "[RESIDENT] video job #1 on this worker: model loader 122 loaded; VRAM used at job start 1.0 GB",
+        "[RESIDENT] video job #2 on this worker: model loader 122 reused from VRAM (cached); VRAM used at job start 1.0 GB",
+    ]
+    assert freed == []  # same model settings: nothing unloaded
+
+
+def test_changed_model_settings_unload_the_old_model_first(mocked_comfy, monkeypatch, caplog):
+    import logging
+    from worker_guard import comfy_api
+    freed = []
+    monkeypatch.setattr(comfy_api, "free", lambda **k: freed.append(1))
+    caplog.set_level(logging.INFO, logger="worker_guard")
+    handler.handler(job())                          # compile on: node 122 has compile_args
+    monkeypatch.setenv("TORCH_COMPILE", "0")
+    handler.handler(job())                          # another model for ComfyUI
+    handler.handler(job())                          # same as the one before: no unload
+    assert freed == [1]
+    assert "[RESIDENT] model settings changed (nodes 122, 177); unloading the previous model before queueing" in caplog.messages
+
+
+VRAM_SNAPSHOT = {
+    "enabled": True, "vae_hooks": True, "interval_ms": 50, "total": 32 * 1024 ** 3, "baseline": 1024 ** 3,
+    "samples": 812, "stages": {"sampler": int(18.4 * 1024 ** 3), "vae_decode": int(21.6 * 1024 ** 3),
+                               "vae_encode": int(19.0 * 1024 ** 3), "other": int(9.5 * 1024 ** 3)},
+    "nodes": {}, "decodes": {"128": 2}, "oom": None,
+}
+
+
+def test_vram_stage_line_and_final_job_line(mocked_comfy, monkeypatch, caplog):
+    import logging
+    from worker_guard import comfy_api
+    monkeypatch.setattr(comfy_api, "vram_stages", lambda timeout=5: VRAM_SNAPSHOT)
+    caplog.set_level(logging.INFO, logger="worker_guard")
+    handler.handler(job(mode="fast480"))
+    assert ("[VRAM] vram peak sampler 18.4 GB, vae 21.6 GB, headroom 10.4 GB (other nodes 9.5 GB; 812 samples every "
+            "50 ms)") in caplog.messages
+    final = [m for m in caplog.messages if m.startswith("[JOB] fast480")]
+    assert len(final) == 1 and re.fullmatch(
+        r"\[JOB\] fast480 done: res 848x480, gen \d+\.\ds, upscale n/a, total \d+\.\ds, attention sageattn, "
+        r"blocks_to_swap 0, vram peak sampler 18\.4 GB / vae 21\.6 GB / upscale n/a", final[0]), final
+    assert any(m.startswith("[OFFLOAD] adaptive: predicted peak n/a (not calibrated, tier value used), chosen "
+                            "blocks_to_swap 0, actual peak 21.6 GB (67%)") for m in caplog.messages)
+    assert mocked_comfy[0]["245"]["inputs"]["value"] == 848 and mocked_comfy[0]["246"]["inputs"]["value"] == 480
+
+
+class OomWs(FakeWs):
+    """First websocket of the test reports an OOM in node 128; later ones succeed."""
+    failures = []
+
+    def __init__(self):
+        super().__init__()
+        if OomWs.failures:
+            OomWs.failures.pop()
+            self.messages = [
+                json.dumps({"type": "execution_start", "data": {"prompt_id": "p1"}}),
+                json.dumps({"type": "execution_error", "data": {
+                    "prompt_id": "p1", "node_id": "128", "node_type": "WanVideoSampler",
+                    "exception_type": "torch.OutOfMemoryError", "exception_message": "Allocation on device",
+                    "traceback": []}}),
+            ]
+
+
+def test_oom_retry_names_the_failing_vae_stage(mocked_comfy, monkeypatch, caplog):
+    import logging
+    from worker_guard import comfy_api
+    snapshots = [{**VRAM_SNAPSHOT, "oom": {"stage": "vae_decode", "node_id": "128", "node_type": "WanVideoSampler",
+                                           "window": 3}}, VRAM_SNAPSHOT]
+    monkeypatch.setattr(comfy_api, "vram_stages", lambda timeout=5: snapshots.pop(0))
+    monkeypatch.setattr(handler.websocket, "WebSocket", OomWs)
+    OomWs.failures = [1]
+    caplog.set_level(logging.INFO, logger="worker_guard")
+    res = handler.handler(job(width=854, height=480))
+    assert res == {"video": base64.b64encode(VIDEO_BYTES).decode()}
+    assert [p["134"]["inputs"]["blocks_to_swap"] for p in mocked_comfy] == [0, 10]
+    assert any(m.startswith("[OFFLOAD] OOM retry 1/4: out of memory at vae_decode (node 128 WanVideoSampler, window 3); "
+                            "blocks_to_swap 0 -> 10") for m in caplog.messages)
+    assert any(m.startswith("[OFFLOAD] RAM (OOM retry 1): ") for m in caplog.messages)
+    # VAE tiling stays off for the whole job
+    assert all(not p["130"]["inputs"]["enable_vae_tiling"] for p in mocked_comfy)

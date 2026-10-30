@@ -6,26 +6,40 @@ where it failed is not measured yet, see TESTING.md step 2).
 Hard rule: 480p on GPUs >= FULL_GPU_MIN_VRAM_GB (28) always runs with 0 / False, whatever the
 client, manual mode or OFFLOAD_TIERS say. Only the emergency OOM retry may change it.
 The client's values are ignored. GPUs below MIN_VRAM_GB (default 28) are rejected (per job here,
-at startup in gpu_check.py). On an OutOfMemoryError the job is retried once with an emergency
-swap: 0 blocks -> OOM_EMERGENCY_BLOCKS (default 6), otherwise 10 more blocks (max 40).
+at startup in gpu_check.py).
+Adaptive (v24): with a calibration (OFFLOAD_CALIBRATION, or DEFAULT_CALIBRATION once measured), jobs
+that are not 480p-on-the-GPU get the SMALLEST blocks_to_swap whose predicted peak fits in
+OFFLOAD_TARGET_FRACTION (0.85) of the VRAM. Without a calibration the tier values are used.
+OOM ladder (v24): on an OutOfMemoryError the job is retried with blocks_to_swap +10, then 25, then 40,
+and only after 40 also ran out of memory, once more with VAE tiling on (output may differ).
 "offload_mode": "manual" (client values as sent) is honoured only with OFFLOAD_ALLOW_MANUAL=1.
 The handler turns blocks_to_swap / force_offload into the workflow settings exactly as before;
 enforce_final() checks the workflow right before /prompt and fixes it if it does not match.
-Tunable without a rebuild: OFFLOAD_TIERS (JSON), OFFLOAD_480P_MAX_PIXELS, MIN_VRAM_GB.
+Tunable without a rebuild: OFFLOAD_TIERS (JSON), OFFLOAD_CALIBRATION (JSON), OFFLOAD_TARGET_FRACTION,
+OFFLOAD_480P_MAX_PIXELS, MIN_VRAM_GB.
 """
 import copy
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger("worker_guard")
 
 MAX_BLOCKS = 40
 DEFAULT_MIN_VRAM_GB = 28
-DEFAULT_OOM_EMERGENCY_BLOCKS = 6
-# OutOfMemoryError in these nodes is retried once with the emergency swap
+# OutOfMemoryError in these nodes starts the OOM ladder
 OOM_RETRY_NODES = frozenset({"WanVideoSampler", "WanVideoDecode"})
+LADDER_STEP = 10
+LADDER_FIXED = (25, MAX_BLOCKS)
+DEFAULT_TARGET_FRACTION = 0.85
+# Until the A.4 runs measure it (wrapper log "Transformer blocks on cpu: X MB" / blocks_to_swap): a Wan 14B
+# block in fp8 is ~0.38 GB, the InfiniteTalk audio layers add a little. Used for the RAM estimate only.
+BLOCK_GB_ESTIMATE = 0.44
+DEFAULT_WINDOW_FRAMES = 81
+# Filled in from the TESTING.md Phase A measurements; None = not calibrated (tier values are used)
+DEFAULT_CALIBRATION = None
+STAGES = ("sampler", "vae")
 DEFAULT_480P_MAX_PIXELS = 900 * 500
 # handler.py defaults when the job sends no width/height
 HANDLER_DEFAULT_SIZE = 512
@@ -49,6 +63,16 @@ WIDTH_NODE, HEIGHT_NODE = "245", "246"
 
 
 @dataclass
+class Prediction:
+    calibrated: bool
+    budget_gb: float
+    foreign_gb: float
+    predicted_gb: float = None
+    fits: bool = True
+    note: str = ""
+
+
+@dataclass
 class Decision:
     mode: str
     blocks_to_swap: int
@@ -57,6 +81,9 @@ class Decision:
     width: int
     height: int
     row: str = None
+    prediction: Prediction = None
+    vae_tiling: bool = False
+    tried: list = field(default_factory=list)
 
 
 def validate_tiers(tiers):
@@ -129,8 +156,68 @@ def min_vram_gb():
     return _env_number("MIN_VRAM_GB", float(DEFAULT_MIN_VRAM_GB), float)
 
 
-def emergency_blocks():
-    return min(MAX_BLOCKS, max(0, _env_number("OOM_EMERGENCY_BLOCKS", DEFAULT_OOM_EMERGENCY_BLOCKS, int)))
+def target_fraction():
+    value = _env_number("OFFLOAD_TARGET_FRACTION", DEFAULT_TARGET_FRACTION, float)
+    if not 0.5 <= value <= 0.95:
+        logger.error(f"[OFFLOAD] OFFLOAD_TARGET_FRACTION={value} outside 0.5..0.95; using {DEFAULT_TARGET_FRACTION}")
+        return DEFAULT_TARGET_FRACTION
+    return value
+
+
+def validate_calibration(cal):
+    """Returns the calibration as floats, or raises ValueError.
+    {"block_gb": B, "sampler": {"base_gb": a, "gb_per_ktoken": b}, "vae": {"base_gb": c, "gb_per_ktoken": d}}
+    Stage peak with N blocks swapped = base_gb + gb_per_ktoken * latent tokens per window / 1000 - N * block_gb."""
+    def number(value, what, positive=False):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or (positive and value <= 0):
+            raise ValueError(f"{what} must be a number {'> 0' if positive else '>= 0'}")
+        return float(value)
+
+    if not isinstance(cal, dict):
+        raise ValueError("must be a JSON object")
+    out = {"block_gb": number(cal.get("block_gb"), "block_gb", positive=True)}
+    for stage in STAGES:
+        settings = cal.get(stage)
+        if not isinstance(settings, dict):
+            raise ValueError(f"missing {stage!r} object")
+        out[stage] = {k: number(settings.get(k), f"{stage}.{k}") for k in ("base_gb", "gb_per_ktoken")}
+    return out
+
+
+def load_calibration():
+    raw = os.environ.get("OFFLOAD_CALIBRATION")
+    if raw and raw.strip():
+        try:
+            return validate_calibration(json.loads(raw))
+        except (ValueError, TypeError) as e:
+            logger.error(f"[OFFLOAD] invalid OFFLOAD_CALIBRATION ({e}); not calibrated, using the tier values")
+            return None
+    return validate_calibration(copy.deepcopy(DEFAULT_CALIBRATION)) if DEFAULT_CALIBRATION else None
+
+
+def block_gb():
+    """(GB per swapped block, 'calibrated' or 'estimate')."""
+    cal = load_calibration()
+    return (cal["block_gb"], "calibrated") if cal else (BLOCK_GB_ESTIMATE, "estimate")
+
+
+def latent_tokens(width, height, window_frames=DEFAULT_WINDOW_FRAMES):
+    """Transformer tokens per InfiniteTalk window: (W/16) x (H/16) x latent frames (81 frames -> 21)."""
+    return (width // 16) * (height // 16) * ((window_frames - 1) // 4 + 1)
+
+
+def predicted_peak_gb(cal, width, height, blocks, window_frames=DEFAULT_WINDOW_FRAMES):
+    ktokens = latent_tokens(width, height, window_frames) / 1000
+    return max(cal[s]["base_gb"] + cal[s]["gb_per_ktoken"] * ktokens for s in STAGES) - blocks * cal["block_gb"]
+
+
+def adaptive_blocks(cal, width, height, budget_gb, window_frames=DEFAULT_WINDOW_FRAMES):
+    """(smallest blocks_to_swap whose predicted peak fits the budget, predicted GB, fits). 40 if none fits."""
+    for blocks in range(MAX_BLOCKS + 1):
+        peak = predicted_peak_gb(cal, width, height, blocks, window_frames)
+        if peak <= budget_gb:
+            return blocks, peak, True
+    return MAX_BLOCKS, predicted_peak_gb(cal, width, height, MAX_BLOCKS, window_frames), False
 
 
 def manual_allowed():
@@ -157,8 +244,10 @@ def vram_reject(vram_total_bytes, gpu_name="GPU"):
     return None
 
 
-def decide(job_input, vram_total_bytes, gpu_name="GPU"):
-    """Returns (Decision, None), or (None, error message) when this GPU must not run the job."""
+def decide(job_input, vram_total_bytes, gpu_name="GPU", vram_used_bytes=None, resident_bytes=0):
+    """Returns (Decision, None), or (None, error message) when this GPU must not run the job.
+    vram_used_bytes: VRAM in use at job start; resident_bytes: VRAM our own models held at the end of the
+    previous job on this worker. The difference (if positive) is not ours and is taken off the budget."""
     vram_gb = vram_total_bytes / (1024 ** 3)
     width = _as_int(job_input.get("width", HANDLER_DEFAULT_SIZE), HANDLER_DEFAULT_SIZE)
     height = _as_int(job_input.get("height", HANDLER_DEFAULT_SIZE), HANDLER_DEFAULT_SIZE)
@@ -192,14 +281,62 @@ def decide(job_input, vram_total_bytes, gpu_name="GPU"):
                 logger.warning(f"[OFFLOAD] OFFLOAD_TIERS {row} row {settings} ignored: {row} on {vram_gb:.1f} GB "
                                "always runs with blocks_to_swap 0, force_offload False")
                 settings = FULL_GPU
-            return Decision(
+            decision = Decision(
                 mode="auto", blocks_to_swap=settings["blocks_to_swap"], force_offload=settings["force_offload"],
                 vram_gb=vram_gb, width=width, height=height, row=row,
-            ), None
+            )
+            _adapt(decision, vram_used_bytes, resident_bytes, full_gpu)
+            return decision, None
     return None, (
         f"[OFFLOAD] {gpu_name} has {vram_gb:.1f} GB VRAM; auto offload needs at least "
         f"{tiers[-1]['min_vram_gb']:.0f} GB. Job not run."
     )
+
+
+def _adapt(decision, vram_used_bytes, resident_bytes, full_gpu):
+    """Sets decision.prediction and, when calibrated (and not a 480p-on-the-GPU job), the adaptive blocks_to_swap."""
+    gb = 1024 ** 3
+    budget = target_fraction() * decision.vram_gb
+    foreign = max(0.0, ((vram_used_bytes or 0) - (resident_bytes or 0)) / gb) if vram_used_bytes is not None else 0.0
+    budget -= foreign
+    cal = load_calibration()
+    pred = Prediction(calibrated=cal is not None, budget_gb=budget, foreign_gb=foreign)
+    decision.prediction = pred
+    if cal is None:
+        pred.note = "not calibrated, tier value used"
+        return
+    pred.predicted_gb = predicted_peak_gb(cal, decision.width, decision.height, decision.blocks_to_swap)
+    if full_gpu:
+        pred.fits = pred.predicted_gb <= budget
+        pred.note = "480p rule: always 0"
+        return
+    blocks, pred.predicted_gb, pred.fits = adaptive_blocks(cal, decision.width, decision.height, budget)
+    pred.note = "smallest that fits" if pred.fits else f"nothing fits; using {MAX_BLOCKS}"
+    # Adaptive jobs keep the model on the GPU after sampling (resident between jobs); nothing after the
+    # sampler needs the VRAM (VAE decode runs inside it, video combine runs on the CPU)
+    decision.blocks_to_swap, decision.force_offload = blocks, False
+
+
+def adaptive_line(decision, actual_peak_bytes, vram_total_bytes):
+    """[OFFLOAD] adaptive: predicted peak X GB (Y%), chosen blocks_to_swap N, actual peak Z GB (W%)"""
+    total_gb = vram_total_bytes / (1024 ** 3) if vram_total_bytes else decision.vram_gb
+    pred = decision.prediction
+    if pred is None or pred.predicted_gb is None:
+        predicted = "n/a (" + (pred.note if pred else f"{decision.mode} mode") + ")"
+    else:
+        predicted = f"{pred.predicted_gb:.1f} GB ({100 * pred.predicted_gb / total_gb:.0f}%)"
+        if pred.note:
+            predicted += f" [{pred.note}]"
+    if actual_peak_bytes:
+        actual_gb = actual_peak_bytes / (1024 ** 3)
+        actual = f"{actual_gb:.1f} GB ({100 * actual_gb / total_gb:.0f}%)"
+    else:
+        actual = "n/a"
+    extra = f", budget {pred.budget_gb:.1f} GB" if pred else ""
+    if pred and pred.foreign_gb >= 0.1:
+        extra += f" (minus {pred.foreign_gb:.1f} GB not ours at job start)"
+    return (f"[OFFLOAD] adaptive: predicted peak {predicted}, chosen blocks_to_swap {decision.blocks_to_swap}, "
+            f"actual peak {actual}{extra}")
 
 
 def apply(job_input, decision):
@@ -211,6 +348,9 @@ def apply(job_input, decision):
     out["force_offload"] = decision.force_offload
     # Let the handler derive load_device from blocks_to_swap (offload_device when > 0)
     out.pop("load_device", None)
+    if decision.vae_tiling:
+        # Last OOM ladder step only (never a normal job): the handler's VAE tiling input
+        out["vae_tiling"] = True
     return out
 
 
@@ -287,14 +427,15 @@ def is_oom(result):
     return "OutOfMemoryError" in str(details.get("exception_type") or "") and details.get("node_type") in OOM_RETRY_NODES
 
 
-EMERGENCY_BLOCK_STEP = 10
-
-
-def emergency_settings(blocks_to_swap, force_offload=False):
-    """(blocks_to_swap, force_offload) for the one emergency retry after an OOM.
-    No offloading -> OOM_EMERGENCY_BLOCKS (6); already swapping -> 10 more blocks (max 40).
-    Always swaps more than the attempt that ran out of memory (unless already at 40);
-    force_offload stays as it was for that attempt."""
-    if blocks_to_swap < emergency_blocks():
-        return emergency_blocks(), force_offload
-    return min(blocks_to_swap + EMERGENCY_BLOCK_STEP, MAX_BLOCKS), force_offload
+def oom_ladder(blocks_to_swap):
+    """Retry steps after an OOM at blocks_to_swap: [(blocks, vae_tiling), ...].
+    +10, then 25, then 40 (each only if more than the step before), then 40 with VAE tiling,
+    which therefore only ever runs after a 40-block attempt ran out of memory."""
+    steps, previous = [], blocks_to_swap
+    for blocks in (blocks_to_swap + LADDER_STEP,) + LADDER_FIXED:
+        blocks = min(blocks, MAX_BLOCKS)
+        if blocks > previous:
+            steps.append((blocks, False))
+            previous = blocks
+    steps.append((MAX_BLOCKS, True))
+    return steps

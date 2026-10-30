@@ -17,7 +17,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from worker_guard import accel, comfy_api, offload
+from worker_guard import accel, comfy_api, modes, offload, sysmem
 from worker_guard.node_timer import NodeTimer
 from worker_guard.speed import SpeedTracker
 
@@ -40,6 +40,15 @@ _sleep = time.sleep
 
 # The job currently running (the handler runs with concurrency 1)
 _current = None
+
+# Per worker: video jobs run so far, the settings of the model ComfyUI holds (upstream of the
+# WanVideoModelLoader; None after /free), and the VRAM our models held when the last job ended
+_jobs_on_worker = 0
+_loader_sig = None
+_resident_used = 0
+
+# OOM ladder time estimate: a retry swaps more blocks, so it is assumed this much slower
+RETRY_SLOWDOWN = 1.5
 
 
 def _env_float(name, default):
@@ -65,11 +74,20 @@ class Settings:
     gpu_check_retry_sec: float
     free_wait_sec: float
     exempt_nodes: frozenset
+    runpod_timeout_sec: float = 0.0
+    return_margin_sec: float = 120.0
+    retry_min_sec: float = 120.0
 
     @classmethod
     def from_env(cls):
         exempt = os.environ.get("VRAM_WATCHDOG_EXEMPT_NODES", DEFAULT_EXEMPT_NODES)
         return cls(
+            # The endpoint's execution timeout (RunPod does not tell the worker, so it is set here too);
+            # 0 = unknown, only JOB_TIMEOUT_SEC applies
+            runpod_timeout_sec=_env_float("RUNPOD_EXECUTION_TIMEOUT_SEC", 0),
+            # Kept free at the end of the RunPod limit for base64 encoding and returning the video
+            return_margin_sec=_env_float("RUNPOD_RETURN_MARGIN_SEC", 120),
+            retry_min_sec=_env_float("OOM_RETRY_MIN_SEC", 120),
             job_timeout_sec=_env_float("JOB_TIMEOUT_SEC", 3600),
             vram_poll_sec=_env_float("VRAM_POLL_SEC", 30),
             vram_sample_sec=_env_float("VRAM_SAMPLE_SEC", 5),
@@ -94,6 +112,19 @@ def _gb(nbytes):
     return nbytes / (1024 ** 3)
 
 
+def time_limit(settings):
+    """(seconds, name) of the job's time limit: JOB_TIMEOUT_SEC, or the RunPod execution timeout minus the
+    return margin when that is shorter."""
+    limit, name = settings.job_timeout_sec, f"JOB_TIMEOUT_SEC={settings.job_timeout_sec:.0f}s"
+    if settings.runpod_timeout_sec > 0:
+        runpod = settings.runpod_timeout_sec - settings.return_margin_sec
+        if runpod < limit:
+            limit = max(0.0, runpod)
+            name = (f"RUNPOD_EXECUTION_TIMEOUT_SEC={settings.runpod_timeout_sec:.0f}s minus "
+                    f"{settings.return_margin_sec:.0f}s to return the video")
+    return limit, name
+
+
 def gpu_name(device):
     """'cuda:0 NVIDIA GeForce RTX 4090 : cudaMallocAsync' -> 'NVIDIA GeForce RTX 4090'."""
     name = (device or {}).get("name") or "unknown GPU"
@@ -107,8 +138,17 @@ class JobContext:
         self.settings = settings
         self.task = task
         self.started = _now()
-        self.deadline = self.started + settings.job_timeout_sec
+        self.limit_sec, self.limit_name = time_limit(settings)
+        self.deadline = self.started + self.limit_sec
         self.frames = self.width = self.height = None
+        self.mode = modes.STANDARD
+        self.attention = None
+        self.cached_nodes = set()
+        self.vram = None
+        self.gen_sec = None
+        self.attempt_started = self.started
+        self.job_number = None
+        self.used_at_start = None
         self.node_classes = {}
         self.prompt_id = None
         self.executing = False
@@ -144,6 +184,8 @@ class JobContext:
         self.frames = _node_value(prompt, FRAMES_NODE)
         self.width = _node_value(prompt, WIDTH_NODE)
         self.height = _node_value(prompt, HEIGHT_NODE)
+        loaders = [n for n in prompt.values() if isinstance(n, dict) and n.get("class_type") == "WanVideoModelLoader"]
+        self.attention = (loaders[0].get("inputs") or {}).get("attention_mode") if loaders else None
         self.node_classes = {
             str(node_id): node.get("class_type") for node_id, node in prompt.items() if isinstance(node, dict)
         }
@@ -206,6 +248,7 @@ class WsProxy:
                 ctx.current_node = node
                 ctx.executing = True
         elif mtype == "execution_cached":
+            ctx.cached_nodes.update(str(n) for n in (data.get("nodes") or []))
             if ctx.nodes is not None:
                 ctx.nodes.on_cached(data.get("nodes"))
         elif mtype == "progress":
@@ -278,7 +321,7 @@ class Watchdog(threading.Thread):
         if now >= ctx.deadline:
             self._trip(
                 "timeout",
-                f"[WATCHDOG] job exceeded JOB_TIMEOUT_SEC={s.job_timeout_sec:.0f}s; workflow interrupted",
+                f"[WATCHDOG] job exceeded {ctx.limit_name}; workflow interrupted",
                 refresh=False,
             )
             return
@@ -470,7 +513,9 @@ def _apply_trip(ctx, result):
 def _free_vram(ctx):
     """Asks ComfyUI to unload models, then waits (bounded) until VRAM actually drops.
     /free is applied asynchronously, so queueing right away could retry with the models still loaded."""
+    global _loader_sig
     s = ctx.settings
+    _loader_sig = None  # nothing resident afterwards: the next prompt loads its model fresh
     try:
         comfy_api.free()
     except Exception as e:
@@ -511,22 +556,175 @@ def _offload_summary(ctx):
     }
 
 
-def _retry_failed(ctx, result):
-    """Error result after the OOM retry also failed."""
+def _retry_failed(ctx, result, reason=None):
+    """Error result after the OOM ladder: a step failed, ran out of memory at 40 + VAE tiling, or was skipped."""
     info = _offload_summary(ctx)
-    what = "out of memory again" if offload.is_oom(result) else "failed again"
+    what = reason or (("out of memory again" if offload.is_oom(result) else "failed again") + " after OOM retry")
     original = result.get("error") if isinstance(result, dict) else None
+    d = ctx.offload
+    steps = " -> ".join(f"{b}{' (VAE tiling)' if t else ''}" for b, t, _ in d.tried + [(d.blocks_to_swap, d.vae_tiling, None)])
     message = (
-        f"[OFFLOAD] {what} after OOM retry: GPU {info['gpu']}, VRAM {info['vram_gb']:.1f} GB, "
+        f"[OFFLOAD] {what}: GPU {info['gpu']}, VRAM {info['vram_gb']:.1f} GB, "
         f"{info['width']}x{info['height']}, frames {_fmt(info['frames'])}, "
-        f"blocks_to_swap {info['blocks_to_swap']}, force_offload {info['force_offload']}"
+        f"blocks_to_swap {info['blocks_to_swap']}, force_offload {info['force_offload']}; ladder {steps}"
         + (f" | ComfyUI: {original}" if original else "")
     )
     logger.error(message)
     out = {"error": message, "offload": info, "refresh_worker": True}
+    if d.vae_tiling:
+        out["emergency_vae_tiling"] = True
     if isinstance(result, dict) and "details" in result:
         out["details"] = result["details"]
     return out
+
+
+def failing_stage(ctx, result):
+    """Where the last attempt ran out of memory, e.g. 'vae_decode (node 128 WanVideoSampler, window 3)'."""
+    vram = ctx.vram or {}
+    oom = vram.get("oom")
+    if oom:
+        return f"{oom['stage']} (node {oom['node_id']} {oom.get('node_type') or '?'}, window {oom['window']})"
+    details = (result.get("details") or {}) if isinstance(result, dict) else {}
+    node_id, node_type = details.get("node_id"), details.get("node_type")
+    if node_type == "WanVideoSampler":
+        decodes = vram.get("decodes")
+        window = (decodes or {}).get(str(node_id), 0) + 1 if decodes is not None else "n/a"
+        return f"sampler (transformer steps, node {node_id} WanVideoSampler, window {window})"
+    if node_type == "WanVideoDecode":
+        return f"vae_decode (node {node_id} WanVideoDecode)"
+    return f"node {node_id} ({node_type})"
+
+
+def _retry_estimate(ctx, attempt_sec):
+    """(seconds a retry is expected to need, how that was estimated)."""
+    sp = ctx.speed
+    if sp is not None and sp.windows and sp.total and sp.spw:
+        total_windows = sp.total // sp.spw
+        per_window = sum(w[1] for w in sp.windows) / len(sp.windows)
+        before = max(0.0, sp.start - ctx.attempt_started) if sp.start is not None else 0.0
+        need = before + per_window * total_windows * RETRY_SLOWDOWN
+        basis = (f"{before:.0f}s before sampling + {total_windows} windows x {per_window:.0f}s x {RETRY_SLOWDOWN} "
+                 "for more swapping")
+    else:
+        need = 2 * attempt_sec
+        basis = f"no window finished: 2 x the {attempt_sec:.0f}s attempt"
+    need += ctx.settings.free_wait_sec
+    if need < ctx.settings.retry_min_sec:
+        return ctx.settings.retry_min_sec, f"{basis}; minimum OOM_RETRY_MIN_SEC"
+    return need, basis
+
+
+OOM_RETRY_FINAL = "[OFFLOAD] OOM retry final: VAE tiling ON (output may differ)"
+
+
+def _oom_ladder(ctx, decision, job, job_input, result, run):
+    """Retries an OOMed auto job with more swapped blocks, then (after 40 also OOMed) with VAE tiling."""
+    steps = offload.oom_ladder(decision.blocks_to_swap)
+    block_gb, block_source = offload.block_gb()
+    for k, (blocks, tiling) in enumerate(steps, 1):
+        stage = failing_stage(ctx, result)
+        need, basis = _retry_estimate(ctx, _now() - ctx.attempt_started)
+        left = ctx.remaining()
+        if left < need:
+            reason = (f"OOM retry {k}/{len(steps)} not started: needs ~{need:.0f}s ({basis}), "
+                      f"only {left:.0f}s left before {ctx.limit_name}; out of memory at {stage}")
+            logger.error(f"[OFFLOAD] {reason}")
+            return _retry_failed(ctx, result, reason)
+        old, old_tiling = decision.blocks_to_swap, decision.vae_tiling
+        decision.tried.append((old, old_tiling, stage))
+        decision.blocks_to_swap, decision.vae_tiling = blocks, tiling
+        ctx.oom_retry = True
+        if tiling:
+            logger.warning(OOM_RETRY_FINAL)
+            logger.warning(f"[OFFLOAD] OOM retry {k}/{len(steps)}: out of memory at {stage} with blocks_to_swap "
+                           f"{old}; retrying with blocks_to_swap {blocks} and VAE tiling (~{need:.0f}s needed, "
+                           f"{left:.0f}s left)")
+        else:
+            logger.warning(f"[OFFLOAD] OOM retry {k}/{len(steps)}: out of memory at {stage}; blocks_to_swap {old} -> "
+                           f"{blocks}, force_offload {decision.force_offload} (~{need:.0f}s needed, {left:.0f}s left)")
+        sysmem.check_swap_ram(blocks, block_gb, block_source, what=f"OOM retry {k}")
+        _free_vram(ctx)
+        result = run({**job, "input": offload.apply(job_input, decision)})
+        if ctx.trip_kind or not offload.is_oom(result):
+            break
+    if ctx.trip_kind:
+        return result
+    if isinstance(result, dict) and result.get("error"):
+        return _retry_failed(ctx, result)
+    if decision.vae_tiling and isinstance(result, dict):
+        result = {**result, "emergency_vae_tiling": True}
+    return result
+
+
+def _stage_peaks(vram):
+    """(sampler, vae, highest of all stages) in bytes from a /worker/vram snapshot; None where unknown."""
+    stages = (vram or {}).get("stages") or {}
+    vae = [stages[k] for k in ("vae_encode", "vae_decode") if k in stages]
+    return stages.get("sampler"), max(vae) if vae else None, max(stages.values()) if stages else None
+
+
+def _gb_or_na(nbytes):
+    return "n/a" if nbytes is None else f"{_gb(nbytes):.1f} GB"
+
+
+def _log_vram(ctx):
+    vram = ctx.vram
+    if not vram:
+        logger.info("[VRAM] vram peak sampler n/a, vae n/a, headroom n/a (no data from ComfyUI /worker/vram)")
+        return
+    sampler, vae, top = _stage_peaks(vram)
+    total = vram.get("total") or (ctx.device or {}).get("vram_total")
+    headroom = None if top is None or not total else total - top
+    other = ((vram.get("stages") or {}).get("other"))
+    note = f"other nodes {_gb_or_na(other)}; {vram.get('samples', 0)} samples every {vram.get('interval_ms', '?')} ms"
+    if not vram.get("vae_hooks"):
+        note += "; VAE inside the sampler counted as sampler"
+    logger.info(f"[VRAM] vram peak sampler {_gb_or_na(sampler)}, vae {_gb_or_na(vae)}, headroom "
+                f"{_gb_or_na(headroom)} ({note})")
+
+
+def loader_signature(prompt):
+    """JSON of the WanVideoModelLoader node(s) and everything upstream of them: what makes ComfyUI
+    reuse the cached (resident) model or load a new one."""
+    stack = [nid for nid, n in prompt.items() if isinstance(n, dict) and n.get("class_type") == "WanVideoModelLoader"]
+    seen = {}
+    while stack:
+        nid = str(stack.pop())
+        if nid in seen or not isinstance(prompt.get(nid), dict):
+            continue
+        node = prompt[nid]
+        seen[nid] = [node.get("class_type"), node.get("inputs") or {}]
+        for value in (node.get("inputs") or {}).values():
+            if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
+                stack.append(value[0])
+    return seen
+
+
+def _changed_nodes(old, new):
+    return sorted(set(old) ^ set(new) | {nid for nid in set(old) & set(new) if old[nid] != new[nid]})
+
+
+def _log_resident(ctx, prompt):
+    loaders = sorted(nid for nid, n in prompt.items() if isinstance(n, dict) and n.get("class_type") == "WanVideoModelLoader")
+    reused = bool(loaders) and all(nid in ctx.cached_nodes for nid in loaders)
+    used = "n/a" if ctx.used_at_start is None else f"{_gb(ctx.used_at_start):.1f} GB"
+    logger.info(f"[RESIDENT] video job #{ctx.job_number} on this worker: model loader {','.join(loaders) or '-'} "
+                f"{'reused from VRAM (cached)' if reused else 'loaded'}; VRAM used at job start {used}")
+
+
+def _log_final_job_line(ctx, result):
+    """[JOB] <mode> done: res WxH, gen Xs, upscale Ys, total Zs, attention <mode>, blocks_to_swap N,
+    vram peak sampler A GB / vae B GB / upscale C GB"""
+    ok = isinstance(result, dict) and not result.get("error")
+    res = "n/a" if ctx.width is None or ctx.height is None else f"{ctx.width}x{ctx.height}"
+    gen = "n/a" if ctx.gen_sec is None else f"{ctx.gen_sec:.1f}s"
+    sampler, vae, _ = _stage_peaks(ctx.vram)
+    blocks = ctx.offload.blocks_to_swap if ctx.offload else "n/a"
+    logger.info(
+        f"[JOB] {ctx.mode} {'done' if ok else 'failed'}: res {res}, gen {gen}, upscale n/a, "
+        f"total {_now() - ctx.started:.1f}s, attention {ctx.attention or 'n/a'}, blocks_to_swap {blocks}, "
+        f"vram peak sampler {_gb_or_na(sampler)} / vae {_gb_or_na(vae)} / upscale n/a"
+    )
 
 
 def _fmt(value):
@@ -572,6 +770,33 @@ def _log_job_line(ctx, result):
         logger.error(f"[JOB] failed in {elapsed:.1f}s ({what}): {str(error)[:300]}")
 
 
+def _unload_if_model_changes(ctx, prompt):
+    """When this prompt needs a different model than the one ComfyUI holds (another blocks_to_swap,
+    attention mode, compile setting ...), unload the old one first so two copies never share the VRAM."""
+    global _loader_sig
+    sig = loader_signature(prompt)
+    if _loader_sig is not None and sig != _loader_sig:
+        logger.info(f"[RESIDENT] model settings changed (nodes {', '.join(_changed_nodes(_loader_sig, sig))}); "
+                    "unloading the previous model before queueing")
+        _free_vram(ctx)
+    _loader_sig = sig
+
+
+def _end_of_video_job(ctx, result):
+    """Adaptive line, the per-mode [JOB] line, and what our models now hold in VRAM (for the next job)."""
+    global _resident_used
+    _, _, top = _stage_peaks(ctx.vram)
+    total = (ctx.device or {}).get("vram_total")
+    logger.info(offload.adaptive_line(ctx.offload, top if top is not None else ctx.peak_vram, total))
+    _log_final_job_line(ctx, result)
+    try:
+        device = comfy_api.first_device(comfy_api.system_stats(timeout=10))
+        if device is not None:
+            _resident_used = device["vram_used"]
+    except Exception:
+        pass
+
+
 def final_offload_check(prompt):
     """Called by handler.queue_prompt right before /prompt, also with WORKER_GUARD_ENABLED=0.
     With the guard on, the workflow must match this job's offload decision (OOM retry included);
@@ -603,10 +828,16 @@ def install(handler, get_videos):
         f"VRAM_NEAR_ZERO_MB={s.vram_near_zero_mb:.0f}, VRAM_IDLE_TIMEOUT_SEC={s.vram_idle_timeout_sec:.0f}, "
         f"exempt nodes={sorted(s.exempt_nodes)}"
     )
+    limit, name = time_limit(s)
+    if s.runpod_timeout_sec > 0:
+        logger.info(f"[GUARD] job time limit {limit:.0f}s ({name})")
+    else:
+        logger.warning("[GUARD] RUNPOD_EXECUTION_TIMEOUT_SEC not set: OOM retries only check JOB_TIMEOUT_SEC. "
+                       "Set it to the endpoint's execution timeout (TESTING.md, Phase A)")
 
     @functools.wraps(handler)
     def guarded_handler(job):
-        global _current
+        global _current, _jobs_on_worker
         job_input = job.get("input", {}) or {}
         task = "tts" if job_input.get("task") == "tts" else "video"
         if task != "tts" and "cmd" in job_input:
@@ -617,6 +848,8 @@ def install(handler, get_videos):
         result = None
 
         def run(run_job):
+            ctx.attempt_started = _now()
+            ctx.vram = None
             try:
                 out = handler(run_job)
             except Exception:
@@ -639,7 +872,21 @@ def install(handler, get_videos):
                 result = run(job)
                 return result
 
-            decision, reject = offload.decide(job_input, ctx.device["vram_total"], gpu_name(ctx.device))
+            # v24 modes (fast480) before the offload decision, so it sees the final size
+            job_input, mode_error = modes.prepare_job_input(job_input)
+            if mode_error:
+                logger.error(mode_error)
+                result = {"error": mode_error}
+                return result
+            ctx.mode = modes.job_mode(job_input)
+            job = {**job, "input": job_input}
+            _jobs_on_worker += 1
+            ctx.job_number = _jobs_on_worker
+            ctx.used_at_start = ctx.device["vram_used"]
+            # with blocks swapped, all of them must fit in RAM (ladder steps up to 40 also logged)
+
+            decision, reject = offload.decide(job_input, ctx.device["vram_total"], gpu_name(ctx.device),
+                                              ctx.device["vram_used"], _resident_used)
             if reject:
                 logger.error(reject)
                 result = {"error": reject, "refresh_worker": True}
@@ -655,6 +902,7 @@ def install(handler, get_videos):
                     f"[OFFLOAD] manual: blocks_to_swap {decision.blocks_to_swap}, "
                     f"force_offload {decision.force_offload} (as sent)"
                 )
+            sysmem.check_swap_ram(decision.blocks_to_swap, *offload.block_gb())
 
             ctx.benchmark = bool(job_input.get("benchmark"))
             if ctx.benchmark:
@@ -684,21 +932,13 @@ def install(handler, get_videos):
                 _free_vram(ctx)
                 result = run({**job, "input": offload.apply(job_input, decision)})
             if decision.mode == "auto" and not ctx.trip_kind and offload.is_oom(result):
-                old = decision.blocks_to_swap
-                decision.blocks_to_swap, decision.force_offload = offload.emergency_settings(old, decision.force_offload)
-                ctx.oom_retry = True
-                logger.warning(
-                    f"[OFFLOAD] emergency swap after OOM: blocks_to_swap {old} -> {decision.blocks_to_swap}, "
-                    f"force_offload {decision.force_offload}"
-                )
-                _free_vram(ctx)
-                result = run({**job, "input": offload.apply(job_input, decision)})
-                if not ctx.trip_kind and isinstance(result, dict) and result.get("error"):
-                    result = _retry_failed(ctx, result)
+                result = _oom_ladder(ctx, decision, job, job_input, result, run)
             return result
         finally:
             _current = None
             _log_job_line(ctx, result)
+            if task != "tts" and ctx.offload is not None:
+                _end_of_video_job(ctx, result)
 
     @functools.wraps(get_videos)
     def monitored_get_videos(ws, prompt, input_type="image", person_count="single"):
@@ -707,10 +947,7 @@ def install(handler, get_videos):
             return get_videos(ws, prompt, input_type, person_count)
         ctx.record_prompt(prompt)
         if ctx.remaining() <= 0:
-            message = (
-                f"[WATCHDOG] job exceeded JOB_TIMEOUT_SEC={ctx.settings.job_timeout_sec:.0f}s "
-                "before the workflow was queued"
-            )
+            message = f"[WATCHDOG] job exceeded {ctx.limit_name} before the workflow was queued"
             ctx.trip("timeout", message, refresh=False)
             logger.error(message)
             raise TimeoutError(message)
@@ -732,15 +969,26 @@ def install(handler, get_videos):
                 logger.info(f"[COMPILE] using {accel.COMPILED_WORKFLOWS[name]}: added {additions[1]}")
         if ctx.fp8_fast:
             logger.warning(accel.apply_fp8_fast(prompt))
+        _unload_if_model_changes(ctx, prompt)
         ctx.speed = SpeedTracker(accel.steps_per_window(prompt), accel.SAMPLER_NODE)
         ctx.nodes = NodeTimer() if accel.env_flag("PROFILE", False) else None
+        ctx.cached_nodes = set()
         watchdog = Watchdog(ctx, ws)
         watchdog.start()
+        started = _now()
         try:
             return get_videos(WsProxy(ws, ctx), prompt, input_type, person_count)
         finally:
+            ctx.gen_sec = _now() - started
             watchdog.stop()
             if ctx.nodes is not None:
                 ctx.nodes.log(ctx.node_classes)
+            try:
+                ctx.vram = comfy_api.vram_stages()
+            except Exception as e:
+                logger.warning(f"[VRAM] /worker/vram failed: {type(e).__name__}: {e}")
+                ctx.vram = None
+            _log_vram(ctx)
+            _log_resident(ctx, prompt)
 
     return guarded_handler, monitored_get_videos
