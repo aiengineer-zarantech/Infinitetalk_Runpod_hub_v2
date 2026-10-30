@@ -453,7 +453,7 @@ A successful fast480 job returns `"upscale": "720p"` next to `"video"`.
 
 ### Endpoint
 
-- Image: `digamberjhazaran/infinitetalk-runpod:v26`, digest `<filled in after the push>`
+- Image: `digamberjhazaran/infinitetalk-runpod:v26`, digest `sha256:0486c8d324685ef7c8bdd4e192e9c48b264a54b6924043a152d282d54ae3d6a6`
 - Same test endpoint settings as Phase A (RTX 5090, execution timeout 3900 s, `RUNPOD_EXECUTION_TIMEOUT_SEC=3900`).
 - Volume: SeedVR2 files go to `/runpod-volume/models/upscale/`. If they are not there, the worker downloads them once
   from `huggingface.co/Comfy-Org/SeedVR2` (revision `df48879`, sha256 checked):
