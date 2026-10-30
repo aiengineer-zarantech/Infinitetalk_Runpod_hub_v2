@@ -137,3 +137,50 @@ def test_main_failed_on_hang(monkeypatch, capsys):
         release.set()
     assert code == 1
     assert "[GPU] FAILED: check did not finish within" in out
+
+
+# ---------------------------------------------------------------- v27: sageattn self-test
+@pytest.mark.parametrize("status, line", [
+    ("ok", "[GPU] sageattn self-test ok (compute capability 8.9)"),
+    ("failed: RuntimeError: no kernel image", "[GPU] sageattn self-test failed: RuntimeError: no kernel image "
+                                              "(compute capability 8.9); jobs will use sdpa"),
+])
+def test_sageattn_self_test_result_is_saved_and_never_fails(monkeypatch, capsys, tmp_path, status, line):
+    import json
+    from worker_guard import attention
+    info_path = tmp_path / "worker_gpu.json"
+    monkeypatch.setattr(gpu_check, "GPU_INFO_PATH", str(info_path))
+    torch = make_torch()
+    torch.__version__ = "2.9.1+cu128"
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(attention, "self_test", lambda t: status)
+    monkeypatch.setattr(attention, "package_versions", lambda: {"sageattention": "2.2.0", "triton": "3.5.1"})
+    assert gpu_check.main() == 0
+    assert line in capsys.readouterr().out
+    info = json.loads(info_path.read_text())
+    assert info["sageattn"] == status
+    assert (info["torch"], info["sageattention"], info["triton"]) == ("2.9.1+cu128", "2.2.0", "3.5.1")
+
+
+def test_sageattn_self_test_timeout_does_not_block_startup(monkeypatch, capsys, tmp_path):
+    import threading
+    from worker_guard import attention
+    monkeypatch.setattr(gpu_check, "GPU_INFO_PATH", str(tmp_path / "worker_gpu.json"))
+    monkeypatch.setattr(gpu_check, "ATTENTION_TEST_TIMEOUT_SEC", 0.2)
+    monkeypatch.setitem(sys.modules, "torch", make_torch())
+    hang = threading.Event()
+    monkeypatch.setattr(attention, "self_test", lambda t: hang.wait(5) and "ok")
+    assert gpu_check.main() == 0
+    hang.set()
+    assert "[GPU] sageattn self-test failed: no result within 0s" in capsys.readouterr().out
+
+
+def test_launch_flags_line():
+    from worker_guard.startup_check import launch_flags_line
+    ok = {"system": {"argv": ["main.py", "--listen", "127.0.0.1", "--port", "8188", "--extra-model-paths-config",
+                                "/x.yaml", "--use-sage-attention"]}}
+    assert launch_flags_line(ok) == ("[COMFY] launch flags: --extra-model-paths-config --use-sage-attention; "
+                                     "no --lowvram / --novram / --cpu-vae")
+    bad = {"system": {"argv": ["main.py", "--lowvram", "--cpu-vae"]}}
+    assert launch_flags_line(bad) == "[COMFY] WARNING: low-VRAM flags --lowvram --cpu-vae are set (launch flags: --lowvram --cpu-vae)"
+    assert launch_flags_line({"system": {}}) == "[COMFY] launch flags: n/a (/system_stats has no argv)"

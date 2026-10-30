@@ -17,7 +17,7 @@ if os.environ.get("STUB_COMFY_CRASH"):
     sys.exit(3)
 time.sleep(float(os.environ.get("STUB_COMFY_DELAY", "0")))
 
-STATS = {"system": {}, "devices": [{
+STATS = {"system": {"argv": ["main.py", *sys.argv[1:]]}, "devices": [{
     "name": "cuda:0 Stub GPU : cudaMallocAsync" if os.environ.get("STUB_COMFY_DEVICE", "cuda") == "cuda" else "cpu",
     "type": os.environ.get("STUB_COMFY_DEVICE", "cuda"), "index": 0,
     "vram_total": 24 * 1024 ** 3, "vram_free": 24 * 1024 ** 3 - 600 * 1024 ** 2,

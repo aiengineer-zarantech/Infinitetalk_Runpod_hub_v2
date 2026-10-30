@@ -20,6 +20,37 @@ echo "=== GPU Guard ==="
 "$PYTHON_BIN" -u "$WORKER_ROOT/worker_guard/gpu_check.py" || { echo "❌ GPU guard failed, exiting so RunPod restarts this worker"; exit 1; }
 T_GPU=$(now)
 
+# v27: ComfyUI core gets --use-sage-attention only if the sageattn self-test in gpu_check.py passed (the installed
+# kernels are Blackwell-only) and ATTENTION_MODE is not sdpa. No self-test result: unchanged (flag kept).
+GPU_INFO="${WORKER_GPU_INFO:-/tmp/worker_gpu.json}"
+SAGE_ARGS=(--use-sage-attention)
+SAGE_STATUS=$("$PYTHON_BIN" -c "import json, sys; print(json.load(open(sys.argv[1])).get('sageattn') or '')" "$GPU_INFO" 2>/dev/null)
+ATTN_MODE=$(printf '%s' "${ATTENTION_MODE:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+if [ "$ATTN_MODE" = "sdpa" ]; then
+    SAGE_ARGS=()
+    echo "ATTENTION_MODE=sdpa: ComfyUI starts without --use-sage-attention"
+elif [ -n "$SAGE_STATUS" ] && [ "$SAGE_STATUS" != "ok" ]; then
+    SAGE_ARGS=()
+    echo "sageattn self-test did not pass: ComfyUI starts without --use-sage-attention, jobs use sdpa"
+fi
+
+# v27: torch.compile caches on the network volume, so a new worker reuses earlier compiles. Only when the volume
+# is mounted and writable; COMPILE_CACHE=0 keeps the container defaults. Values already set in the env win.
+COMPILE_CACHE_VOLUME="${COMPILE_CACHE_VOLUME:-/runpod-volume}"
+COMPILE_CACHE_ROOT="$COMPILE_CACHE_VOLUME/cache/compile"
+if [ "${COMPILE_CACHE:-1}" = "0" ]; then
+    echo "[COMPILE] cache: COMPILE_CACHE=0, compile caches stay in the container (lost when the worker stops)"
+elif [ -d "$COMPILE_CACHE_VOLUME" ] && [ -w "$COMPILE_CACHE_VOLUME" ] \
+        && mkdir -p "$COMPILE_CACHE_ROOT/inductor" "$COMPILE_CACHE_ROOT/triton" 2>/dev/null; then
+    export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$COMPILE_CACHE_ROOT/inductor}"
+    export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$COMPILE_CACHE_ROOT/triton}"
+    export TORCHINDUCTOR_FX_GRAPH_CACHE="${TORCHINDUCTOR_FX_GRAPH_CACHE:-1}"
+    export TORCHINDUCTOR_AUTOGRAD_CACHE="${TORCHINDUCTOR_AUTOGRAD_CACHE:-1}"
+    echo "[COMPILE] cache: TORCHINDUCTOR_CACHE_DIR=$TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
+else
+    echo "[COMPILE] cache: $COMPILE_CACHE_VOLUME not mounted or not writable, compile caches stay in the container"
+fi
+
 echo "=== Model Setup & Discovery (background) ==="
 "$PYTHON3_BIN" -u "$WORKER_ROOT/setup_models.py" &
 COPY_PID=$!
@@ -41,7 +72,7 @@ fi
 
 # ComfyUI ko --extra-model-paths-config ke sath run karein (GPU only, no CPU fallback flags).
 # Output goes to comfyui.log (the handler reads its tail on errors) and to the worker log as [comfy].
-PYTHONUNBUFFERED=1 "$PYTHON_BIN" main.py --listen 127.0.0.1 --port "$COMFY_PORT" --extra-model-paths-config "$COMFY_DIR/extra_model_paths.yaml" --use-sage-attention "${COMFY_ALLOC_ARGS[@]}" \
+PYTHONUNBUFFERED=1 "$PYTHON_BIN" main.py --listen 127.0.0.1 --port "$COMFY_PORT" --extra-model-paths-config "$COMFY_DIR/extra_model_paths.yaml" "${SAGE_ARGS[@]}" "${COMFY_ALLOC_ARGS[@]}" \
     > >(tee "$COMFY_LOG" | sed -u 's/^/[comfy] /') 2>&1 &
 COMFY_PID=$!
 

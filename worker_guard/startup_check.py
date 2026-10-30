@@ -13,6 +13,20 @@ from worker_guard import comfy_api  # noqa: E402
 from worker_guard.job_guard import DEFAULT_VRAM_NEAR_ZERO_MB  # noqa: E402
 
 STATS_ATTEMPTS = 5
+# ComfyUI flags that move models or the VAE off the GPU; none of them is ever passed by entrypoint.sh
+LOW_VRAM_FLAGS = ("--lowvram", "--novram", "--cpu-vae", "--cpu")
+
+
+def launch_flags_line(stats):
+    """[COMFY] line confirming that ComfyUI runs without low-VRAM flags (argv from /system_stats)."""
+    argv = ((stats or {}).get("system") or {}).get("argv")
+    if not isinstance(argv, list):
+        return "[COMFY] launch flags: n/a (/system_stats has no argv)"
+    found = [a for a in argv if a in LOW_VRAM_FLAGS]
+    flags = " ".join(a for a in argv if str(a).startswith("--") and a not in ("--listen", "--port"))
+    if found:
+        return f"[COMFY] WARNING: low-VRAM flags {' '.join(found)} are set (launch flags: {flags})"
+    return f"[COMFY] launch flags: {flags or 'none'}; no --lowvram / --novram / --cpu-vae"
 
 
 def main(argv=None):
@@ -23,10 +37,11 @@ def main(argv=None):
     parser.add_argument("--comfy-ready", type=float, required=True, help="ComfyUI answered HTTP")
     args = parser.parse_args(argv)
 
-    device, last_error = None, None
+    device, last_error, stats = None, None, None
     for attempt in range(STATS_ATTEMPTS):
         try:
-            device = comfy_api.first_device(comfy_api.system_stats(timeout=10))
+            stats = comfy_api.system_stats(timeout=10)
+            device = comfy_api.first_device(stats)
             break
         except Exception as e:
             last_error = e
@@ -48,6 +63,7 @@ def main(argv=None):
     if device["type"] != "cuda":
         print(f"[COMFY] FAILED: device type is '{device['type']}', expected cuda", flush=True)
         return 1
+    print(launch_flags_line(stats), flush=True)
 
     now = time.time()
     print(

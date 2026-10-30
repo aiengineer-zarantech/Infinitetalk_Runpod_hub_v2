@@ -17,7 +17,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from worker_guard import accel, comfy_api, modes, offload, sysmem, upscale
+from worker_guard import accel, attention, comfy_api, modes, offload, sysmem, upscale
 from worker_guard.node_timer import NodeTimer
 from worker_guard.speed import SpeedTracker
 
@@ -143,6 +143,8 @@ class JobContext:
         self.frames = self.width = self.height = None
         self.mode = modes.STANDARD
         self.attention = None
+        self.attention_mode = None
+        self.attention_note = "n/a"
         self.cached_nodes = set()
         self.vram = None
         self.gen_sec = None
@@ -707,6 +709,18 @@ def _changed_nodes(old, new):
     return sorted(set(old) ^ set(new) | {nid for nid in set(old) & set(new) if old[nid] != new[nid]})
 
 
+def _accel_line(ctx):
+    """[ACCEL] one line per video job: attention, compile, block swap, GPU and the versions gpu_check.py saved."""
+    info = accel.gpu_info() or {}
+    device = ctx.device or {}
+    vram = f"{_gb(device['vram_total']):.1f} GB" if device.get("vram_total") else "n/a"
+    blocks = ctx.offload.blocks_to_swap if ctx.offload else "n/a"
+    cache = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or "container default (not kept)"
+    return (f"[ACCEL] attention {ctx.attention_note}, torch_compile {ctx.compile_note}, blocks_to_swap {blocks}, "
+            f"gpu {gpu_name(device)}, vram {vram}, torch {info.get('torch', 'n/a')}, cuda {info.get('cuda', 'n/a')}, "
+            f"sageattention {info.get('sageattention', 'n/a')}, triton {info.get('triton', 'n/a')}, compile cache {cache}")
+
+
 def _log_resident(ctx, prompt):
     loaders = sorted(nid for nid, n in prompt.items() if isinstance(n, dict) and n.get("class_type") == "WanVideoModelLoader")
     reused = bool(loaders) and all(nid in ctx.cached_nodes for nid in loaders)
@@ -1031,6 +1045,8 @@ def install(handler, get_videos):
             ctx.compile_on, ctx.compile_note = accel.compile_decision(job_input, ctx.benchmark)
             ctx.fp8_fast = accel.fp8_decision(job_input, ctx.benchmark)
             logger.info(f"[COMPILE] torch.compile {ctx.compile_note}; fp8_fast {'on' if ctx.fp8_fast else 'off'}")
+            ctx.attention_mode, ctx.attention_note = attention.decide(job_input, ctx.benchmark, accel.gpu_info())
+            logger.info(_accel_line(ctx))
 
             if job_input.get("person_count") == "multi":
                 result = _ensure_multi_model(ctx)
@@ -1067,6 +1083,10 @@ def install(handler, get_videos):
         ctx = _current
         if ctx is None:
             return get_videos(ws, prompt, input_type, person_count)
+        if ctx.attention_mode:
+            changed = attention.apply(prompt, ctx.attention_mode)
+            if changed:
+                logger.info(f"[ACCEL] attention_mode {ctx.attention_mode} set on node {', '.join(changed)}")
         ctx.record_prompt(prompt)
         if ctx.remaining() <= 0:
             message = f"[WATCHDOG] job exceeded {ctx.limit_name} before the workflow was queued"

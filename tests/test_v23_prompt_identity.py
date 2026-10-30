@@ -66,9 +66,9 @@ def _git_tree(tag, dest):
         tar.extractall(dest)
 
 
-def _run(root, tmp_path, name):
+def _run(root, tmp_path, name, job_list=JOBS):
     jobs = tmp_path / "jobs.json"
-    jobs.write_text(json.dumps(JOBS), encoding="utf-8")
+    jobs.write_text(json.dumps(job_list), encoding="utf-8")
     out = tmp_path / f"{name}.json"
     proc = subprocess.run([sys.executable, str(DRIVER), str(root), str(jobs), str(out)],
                           capture_output=True, text=True, timeout=300)
@@ -83,9 +83,15 @@ def test_old_jobs_post_identical_workflows_and_results(tmp_path):
     for name in TREE_FILES:
         src = REPO_ROOT / name
         (shutil.copytree if src.is_dir() else shutil.copy)(src, new_root / name)
-    old = _run(old_root, tmp_path, "old")
-    new = _run(new_root, tmp_path, "new")
-    assert len(old["prompts"]) == len(new["prompts"]) == len(JOBS)
+    # v27: on a Blackwell GPU whose sageattn self-test passed (gpu_check.py info file), default jobs are unchanged
+    gpu_ok = tmp_path / "gpu_sage_ok.json"
+    gpu_ok.write_text(json.dumps({"name": "NVIDIA GeForce RTX 5090", "capability": "12.0", "total_gb": 31.36,
+                                  "cuda": "12.8", "sageattn": "ok"}), encoding="utf-8")
+    jobs = JOBS + [({"WORKER_GPU_INFO": str(gpu_ok)}, STUDIO),
+                   ({"WORKER_GPU_INFO": str(gpu_ok), "ATTENTION_MODE": "sageattn"}, {**STUDIO, "width": 854})]
+    old = _run(old_root, tmp_path, "old", jobs)
+    new = _run(new_root, tmp_path, "new", jobs)
+    assert len(old["prompts"]) == len(new["prompts"]) == len(jobs)
     for i, (a, b) in enumerate(zip(old["prompts"], new["prompts"])):
         assert a == b, f"job {i}: queued workflow differs"
     assert old["results"] == new["results"]

@@ -11,12 +11,15 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from worker_guard import attention  # noqa: E402  (stdlib only at import)
 from worker_guard.offload import min_vram_gb  # noqa: E402  (stdlib only; same MIN_VRAM_GB as the job check)
 
 MATMUL_SIZE = 1024
 GPU_CHECK_TIMEOUT_SEC = float(os.environ.get("GPU_CHECK_TIMEOUT_SEC", "120"))
-# Read by the handler process (worker_guard.accel) to decide whether torch.compile can work
+# Read by the handler process (worker_guard.accel) to decide whether torch.compile and sageattn can work,
+# and by entrypoint.sh (sageattn result)
 GPU_INFO_PATH = os.environ.get("WORKER_GPU_INFO", "/tmp/worker_gpu.json")
+ATTENTION_TEST_TIMEOUT_SEC = float(os.environ.get("ATTENTION_TEST_TIMEOUT_SEC", "60"))
 
 
 class GpuCheckError(Exception):
@@ -49,12 +52,26 @@ def run_check(torch):
     }
 
 
+def attention_check(torch):
+    """sageattn self-test (worker_guard/attention.py). Never fails the guard: jobs fall back to sdpa."""
+    out = {}
+
+    def target():
+        out["status"] = attention.self_test(torch)
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(ATTENTION_TEST_TIMEOUT_SEC)
+    return out.get("status") or f"failed: no result within {ATTENTION_TEST_TIMEOUT_SEC:.0f}s"
+
+
 def main():
     result = {}
 
     def target():
         try:
             import torch
+            result["torch"] = torch
             result["info"] = run_check(torch)
         except BaseException as e:
             result["error"] = f"{type(e).__name__}: {e}"
@@ -83,10 +100,20 @@ def main():
         f"{MATMUL_SIZE}x{MATMUL_SIZE} matmul OK in {info['matmul_ms']:.0f} ms",
         flush=True,
     )
+    torch = result["torch"]
+    sage = attention_check(torch)
+    if sage == attention.SELF_TEST_OK:
+        print(f"[GPU] sageattn self-test ok (compute capability {info['capability']})", flush=True)
+    else:
+        print(f"[GPU] sageattn self-test {sage} (compute capability {info['capability']}); jobs will use "
+              f"{attention.FALLBACK_MODE}", flush=True)
+    versions = attention.package_versions()
     try:
         with open(GPU_INFO_PATH, "w", encoding="utf-8") as f:
             json.dump({"name": info["name"], "capability": info["capability"],
-                       "total_gb": round(info["total_gb"], 2), "cuda": info["cuda"]}, f)
+                       "total_gb": round(info["total_gb"], 2), "cuda": info["cuda"],
+                       "sageattn": sage, "torch": str(getattr(torch, "__version__", "unknown")),
+                       "sageattention": versions["sageattention"], "triton": versions["triton"]}, f)
     except OSError as e:
         print(f"[GPU] could not write {GPU_INFO_PATH}: {e}", flush=True)
     return 0

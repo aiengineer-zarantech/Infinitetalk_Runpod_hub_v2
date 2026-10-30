@@ -534,3 +534,57 @@ def test_peak_vram_sampled_every_5s_logged_every_30s(gpu, clock, caplog):
         wd.tick()
     assert ctx.peak_vram == 22000 * MB
     assert len([m for m in caplog.messages if m.startswith("[WATCHDOG] VRAM used")]) == 1
+
+
+# ---------------------------------------------------------------- v27: BLOCKS_TO_SWAP env
+def test_blocks_to_swap_unset_keeps_auto():
+    d, _ = offload.decide({"width": 1280, "height": 720}, 31.4 * GB)
+    assert (d.blocks_to_swap, d.force_offload) == (25, True)
+
+
+@pytest.mark.parametrize("raw, vram_gb, expected", [
+    ("10", 31.4, (10, False)), (" 0 ", 31.4, (0, False)), ("40", 47.5, (40, False)), ("0", 47.5, (0, False)),
+])
+def test_blocks_to_swap_overrides_auto(monkeypatch, caplog, raw, vram_gb, expected):
+    monkeypatch.setenv("BLOCKS_TO_SWAP", raw)
+    with caplog.at_level(logging.INFO, logger="worker_guard"):
+        d, err = offload.decide({"width": 1280, "height": 720}, vram_gb * GB)
+    assert err is None and d.mode == "auto"
+    assert (d.blocks_to_swap, d.force_offload) == expected
+    assert f"[OFFLOAD] BLOCKS_TO_SWAP={expected[0]}: 1280x720 uses blocks_to_swap {expected[0]}" in caplog.text
+
+
+@pytest.mark.parametrize("vram_gb", [28.0, 31.4, 47.5])
+def test_blocks_to_swap_never_applies_to_480p(monkeypatch, caplog, vram_gb):
+    monkeypatch.setenv("BLOCKS_TO_SWAP", "20")
+    d, _ = offload.decide({"width": 848, "height": 480}, vram_gb * GB)
+    assert (d.blocks_to_swap, d.force_offload) == (0, False)
+    assert "BLOCKS_TO_SWAP=20 ignored: 848x480" in caplog.text
+
+
+@pytest.mark.parametrize("raw", ["abc", "-1", "41", "2.5"])
+def test_invalid_blocks_to_swap_is_ignored(monkeypatch, caplog, raw):
+    monkeypatch.setenv("BLOCKS_TO_SWAP", raw)
+    d, _ = offload.decide({"width": 1280, "height": 720}, 31.4 * GB)
+    assert (d.blocks_to_swap, d.force_offload) == (25, True)
+    assert f"invalid BLOCKS_TO_SWAP={raw!r}" in caplog.text
+
+
+def test_blocks_to_swap_does_not_touch_manual_mode(monkeypatch):
+    monkeypatch.setenv("BLOCKS_TO_SWAP", "5")
+    monkeypatch.setenv("OFFLOAD_ALLOW_MANUAL", "1")
+    d, _ = offload.decide({"width": 1280, "height": 720, "offload_mode": "manual", "blocks_to_swap": 30,
+                           "force_offload": True}, 31.4 * GB)
+    assert (d.mode, d.blocks_to_swap, d.force_offload) == ("manual", 30, True)
+
+
+def test_blocks_to_swap_with_calibration_updates_the_prediction(monkeypatch):
+    cal = {"block_gb": 0.4, "sampler": {"base_gb": 30, "gb_per_ktoken": 0.5}, "vae": {"base_gb": 6, "gb_per_ktoken": 0.2}}
+    monkeypatch.setenv("OFFLOAD_CALIBRATION", json.dumps(cal))
+    monkeypatch.setenv("BLOCKS_TO_SWAP", "5")
+    d, _ = offload.decide({"width": 1280, "height": 720}, 31.4 * GB, vram_used_bytes=GB, resident_bytes=GB)
+    assert (d.blocks_to_swap, d.force_offload) == (5, False)
+    assert d.prediction.note == "BLOCKS_TO_SWAP=5 (env)"
+    expected = offload.predicted_peak_gb(offload.load_calibration(), 1280, 720, 5)
+    assert d.prediction.predicted_gb == expected and d.prediction.fits == (expected <= d.prediction.budget_gb)
+    assert "chosen blocks_to_swap 5" in offload.adaptive_line(d, 20 * GB, int(31.4 * GB))

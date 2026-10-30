@@ -17,6 +17,8 @@ The handler turns blocks_to_swap / force_offload into the workflow settings exac
 enforce_final() checks the workflow right before /prompt and fixes it if it does not match.
 Tunable without a rebuild: OFFLOAD_TIERS (JSON), OFFLOAD_CALIBRATION (JSON), OFFLOAD_TARGET_FRACTION,
 OFFLOAD_480P_MAX_PIXELS, MIN_VRAM_GB.
+BLOCKS_TO_SWAP (v27): unset = the auto logic above. A value 0..40 replaces the tier / adaptive choice for auto jobs
+(force_offload False, OOM ladder still on), except 480p on >= 28 GB, which stays 0.
 """
 import copy
 import json
@@ -156,6 +158,21 @@ def min_vram_gb():
     return _env_number("MIN_VRAM_GB", float(DEFAULT_MIN_VRAM_GB), float)
 
 
+def blocks_override():
+    """BLOCKS_TO_SWAP as an int 0..MAX_BLOCKS, or None when unset or invalid (invalid is logged)."""
+    raw = os.environ.get("BLOCKS_TO_SWAP")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if not 0 <= value <= MAX_BLOCKS:
+        logger.error(f"[OFFLOAD] invalid BLOCKS_TO_SWAP={raw!r} (0..{MAX_BLOCKS}); ignored, auto logic used")
+        return None
+    return value
+
+
 def target_fraction():
     value = _env_number("OFFLOAD_TARGET_FRACTION", DEFAULT_TARGET_FRACTION, float)
     if not 0.5 <= value <= 0.95:
@@ -286,6 +303,7 @@ def decide(job_input, vram_total_bytes, gpu_name="GPU", vram_used_bytes=None, re
                 vram_gb=vram_gb, width=width, height=height, row=row,
             )
             _adapt(decision, vram_used_bytes, resident_bytes, full_gpu)
+            _apply_blocks_override(decision, full_gpu)
             return decision, None
     return None, (
         f"[OFFLOAD] {gpu_name} has {vram_gb:.1f} GB VRAM; auto offload needs at least "
@@ -315,6 +333,28 @@ def _adapt(decision, vram_used_bytes, resident_bytes, full_gpu):
     # Adaptive jobs keep the model on the GPU after sampling (resident between jobs); nothing after the
     # sampler needs the VRAM (VAE decode runs inside it, video combine runs on the CPU)
     decision.blocks_to_swap, decision.force_offload = blocks, False
+
+
+def _apply_blocks_override(decision, full_gpu):
+    override = blocks_override()
+    if override is None:
+        return
+    size = f"{decision.width}x{decision.height}"
+    if full_gpu:
+        if override != 0:
+            logger.warning(f"[OFFLOAD] BLOCKS_TO_SWAP={override} ignored: {size} on {decision.vram_gb:.1f} GB always runs "
+                           "with blocks_to_swap 0, force_offload False")
+        return
+    logger.info(f"[OFFLOAD] BLOCKS_TO_SWAP={override}: {size} uses blocks_to_swap {override} instead of "
+                f"{decision.blocks_to_swap}, force_offload False")
+    decision.blocks_to_swap, decision.force_offload = override, False
+    pred = decision.prediction
+    if pred is not None:
+        cal = load_calibration()
+        if cal is not None:
+            pred.predicted_gb = predicted_peak_gb(cal, decision.width, decision.height, override)
+            pred.fits = pred.predicted_gb <= pred.budget_gb
+        pred.note = f"BLOCKS_TO_SWAP={override} (env)"
 
 
 def adaptive_line(decision, actual_peak_bytes, vram_total_bytes):

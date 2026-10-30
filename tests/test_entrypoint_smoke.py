@@ -169,3 +169,86 @@ def test_comfy_start_timeout_exits(run):
     assert rc == 1
     assert "ComfyUI failed to start within 3 seconds" in out
     assert "HANDLER STARTED" not in out
+
+
+# ---------------------------------------------------------------- v27: sage flag, compile cache, launch flags
+def handler_env(out, name):
+    return re.search(rf"HANDLER ENV {name}=(.*)", out).group(1).strip()
+
+
+def test_launch_flags_line(run):
+    rc, out, _ = run()
+    assert rc == 0, out
+    assert "[COMFY] launch flags: --extra-model-paths-config --use-sage-attention; no --lowvram / --novram / --cpu-vae" in out
+
+
+def test_sage_flag_kept_when_self_test_passed(run):
+    rc, out, _ = run(STUB_SAGE="ok")
+    assert rc == 0, out
+    assert comfy_args(out).endswith(" --use-sage-attention")
+    assert "without --use-sage-attention" not in out
+
+
+def test_sage_flag_dropped_when_self_test_failed(run):
+    rc, out, _ = run(STUB_SAGE="failed: RuntimeError: no kernel image")
+    assert rc == 0, out
+    assert "sageattn self-test did not pass: ComfyUI starts without --use-sage-attention, jobs use sdpa" in out
+    assert "--use-sage-attention" not in comfy_args(out)
+    assert "HANDLER STARTED" in out
+
+
+@pytest.mark.parametrize("value", ["sdpa", " SDPA "])
+def test_sage_flag_dropped_with_attention_mode_sdpa(run, value):
+    rc, out, _ = run(STUB_SAGE="ok", ATTENTION_MODE=value)
+    assert rc == 0, out
+    assert "ATTENTION_MODE=sdpa: ComfyUI starts without --use-sage-attention" in out
+    assert "--use-sage-attention" not in comfy_args(out)
+
+
+def test_sage_flag_kept_with_alloc_mode(run):
+    rc, out, _ = run(STUB_SAGE="ok", ALLOC_MODE="native_expandable")
+    assert rc == 0, out
+    assert comfy_args(out).endswith(" --use-sage-attention --disable-cuda-malloc")
+
+
+def test_compile_cache_on_the_volume(run, tmp_path):
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    rc, out, _ = run(COMPILE_CACHE_VOLUME=posix(volume))
+    assert rc == 0, out
+    root = f"{posix(volume)}/cache/compile"
+    assert f"[COMPILE] cache: TORCHINDUCTOR_CACHE_DIR={root}/inductor, TRITON_CACHE_DIR={root}/triton" in out
+    assert handler_env(out, "TORCHINDUCTOR_CACHE_DIR") == f"{root}/inductor"
+    assert handler_env(out, "TRITON_CACHE_DIR") == f"{root}/triton"
+    assert handler_env(out, "TORCHINDUCTOR_FX_GRAPH_CACHE") == "1"
+    assert handler_env(out, "TORCHINDUCTOR_AUTOGRAD_CACHE") == "1"
+    assert (volume / "cache" / "compile" / "inductor").is_dir() and (volume / "cache" / "compile" / "triton").is_dir()
+
+
+def test_compile_cache_without_a_volume_creates_nothing(run, tmp_path):
+    missing = tmp_path / "no_volume"
+    rc, out, _ = run(COMPILE_CACHE_VOLUME=posix(missing))
+    assert rc == 0, out
+    assert f"[COMPILE] cache: {posix(missing)} not mounted or not writable, compile caches stay in the container" in out
+    assert handler_env(out, "TORCHINDUCTOR_CACHE_DIR") == "<unset>"
+    assert not missing.exists()
+
+
+def test_compile_cache_off(run, tmp_path):
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    rc, out, _ = run(COMPILE_CACHE_VOLUME=posix(volume), COMPILE_CACHE="0")
+    assert rc == 0, out
+    assert "[COMPILE] cache: COMPILE_CACHE=0, compile caches stay in the container" in out
+    assert handler_env(out, "TORCHINDUCTOR_CACHE_DIR") == "<unset>"
+    assert not (volume / "cache").exists()
+
+
+def test_compile_cache_env_already_set_wins(run, tmp_path):
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    custom = posix(tmp_path / "custom")
+    rc, out, _ = run(COMPILE_CACHE_VOLUME=posix(volume), TORCHINDUCTOR_CACHE_DIR=custom)
+    assert rc == 0, out
+    assert handler_env(out, "TORCHINDUCTOR_CACHE_DIR") == custom
+    assert handler_env(out, "TRITON_CACHE_DIR") == f"{posix(volume)}/cache/compile/triton"

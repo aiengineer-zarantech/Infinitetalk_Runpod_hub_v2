@@ -1,0 +1,60 @@
+# ==============================================================================
+# Dockerfile.v27 - attention / compile cache / block swap switches on top of v26 (branch feature/speedup-sage-compile)
+# ==============================================================================
+# - ATTENTION_MODE env: "sageattn" (default, as in the workflows) | "sdpa". gpu_check.py runs a sageattn self-test on
+#   cuda:0 at startup (the installed sageattention 2.2.0 has Blackwell sm_120a kernels only); where it fails
+#   (A40, L40, L40S, RTX 6000 Ada) jobs use sdpa and ComfyUI starts without --use-sage-attention. Node 122 is
+#   only changed when the mode differs, so default jobs on the 5090 queue exactly the same prompt as before.
+# - torch.compile caches (inductor + triton) on the network volume: /runpod-volume/cache/compile (COMPILE_CACHE=0: off).
+# - BLOCKS_TO_SWAP env: unset = unchanged auto logic; 480p on >= 28 GB always 0.
+# - One [ACCEL] line per video job; [COMFY] launch flags line at startup. [SPEED] / [PROGRESS] unchanged.
+# Replaces /worker_guard and /entrypoint.sh. handler, setup_models, workflows, custom nodes, ComfyUI core and
+# all Python packages are inherited from v26 unchanged (checked). Installs nothing.
+FROM digamberjhazaran/infinitetalk-runpod:v26
+
+SHELL ["/bin/bash", "-c"]
+
+# 1. Baseline freeze + fingerprints of the files this image must NOT change; v26 entrypoint is the expected one
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
+    echo "501c2fa4f109552aa5f0012800072fb0d81336f0a224a7c33539e0773aefbc8c  /entrypoint.sh" | sha256sum -c --quiet && \
+    sha256sum /handler.py /setup_models.py /extra_model_paths.yaml /Upscale_SeedVR2.json \
+        /I2V_single.json /I2V_multi.json /V2V_single.json /V2V_multi.json \
+        /I2V_single_compiled.json /I2V_multi_compiled.json > /tmp/unchanged.sha256 && \
+    echo "c2656b42f7371e952dd83e07bdd9bc4bb3e6918a358fa8caf1a837fc549ff742  /handler.py" | sha256sum -c --quiet && \
+    echo "8fe96d8694a504d5ac643429e03be9a85c857828c31a74f501ba093663734d55  /setup_models.py" | sha256sum -c --quiet && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes.sha256 && \
+    find /ComfyUI/comfy /ComfyUI/comfy_extras -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum > /tmp/comfy_core.sha256
+
+# 2. New worker_guard (whole folder replaced so no stale module survives) and entrypoint
+RUN rm -rf /worker_guard
+COPY worker_guard/ /worker_guard/
+COPY entrypoint.sh /entrypoint.sh
+RUN find /worker_guard -name '*.py' -exec sed -i 's/\r$//' {} + && \
+    sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh && bash -n /entrypoint.sh && \
+    grep -qF '"${SAGE_ARGS[@]}"' /entrypoint.sh && \
+    grep -q 'TORCHINDUCTOR_CACHE_DIR=' /entrypoint.sh && \
+    rm -rf /worker_guard/__pycache__ && \
+    cd / && python -c "import worker_guard.job_guard, worker_guard.attention, worker_guard.gpu_check, \
+worker_guard.startup_check, setup_models; print('worker_guard + attention import OK')" && \
+    rm -rf /worker_guard/__pycache__ /__pycache__
+
+# 3. Smoke check against the installed ComfyUI and packages (CPU, throwaway copy). Nothing is written.
+COPY scripts/smoke_v27.py /tmp/smoke_v27.py
+RUN cd / && PYTHONDONTWRITEBYTECODE=1 timeout 900 /usr/bin/python3.10 /tmp/smoke_v27.py / && \
+    rm -f /tmp/smoke_v27.py && rm -rf /worker_guard/__pycache__ /__pycache__
+
+# 4. LAST RUN STEP: unchanged files + unchanged custom nodes + unchanged ComfyUI core + zero package drift
+RUN sha256sum -c --quiet /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 \
+        | sort -z | xargs -0 sha256sum > /tmp/custom_nodes_post.sha256 && \
+    diff -u /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
+    find /ComfyUI/comfy /ComfyUI/comfy_extras -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum > /tmp/comfy_core_post.sha256 && \
+    diff -u /tmp/comfy_core.sha256 /tmp/comfy_core_post.sha256 && \
+    /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "CRITICAL ERROR: files, custom nodes, ComfyUI core or the Python environment changed during the v27 build!"; \
+        exit 1; \
+    } && \
+    rm -f /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt /tmp/unchanged.sha256 /tmp/custom_nodes.sha256 \
+        /tmp/custom_nodes_post.sha256 /tmp/comfy_core.sha256 /tmp/comfy_core_post.sha256 && \
+    echo "OK: handler/setup_models/workflows/custom nodes/ComfyUI core unchanged. Zero package drift."
