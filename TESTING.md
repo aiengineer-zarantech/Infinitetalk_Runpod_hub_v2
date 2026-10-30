@@ -263,7 +263,7 @@ result is identical. New behaviour only starts with the new `"mode": "fast480"` 
 
 ### Endpoint
 
-- Image: `digamberjhazaran/infinitetalk-runpod:v24`, digest `DIGEST_V24`
+- Image: `digamberjhazaran/infinitetalk-runpod:v24`, digest `sha256:2ca2170389752fbae558a9e54997fe04f2d62f9d654e60b37e08abde06af3870`
 - GPU: RTX 5090 (31.4 GB). Use a test endpoint, not production. Max workers 1 for A.3 (both jobs must reach the same warm worker).
 - **Execution timeout: 3900 s** (endpoint settings, Execution Timeout), and env **`RUNPOD_EXECUTION_TIMEOUT_SEC=3900`**
   with the same number. RunPod does not tell the worker its timeout, so the worker needs the env to know it.
