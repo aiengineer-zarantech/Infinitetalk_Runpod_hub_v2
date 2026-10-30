@@ -1,0 +1,69 @@
+# ==============================================================================
+# Dockerfile.v26 - fast480 + SeedVR2 720p upscale on top of v25 (branch feature/fast480-upscale)
+# ==============================================================================
+# - "mode": "fast480" is now upscaled to 1280x720 / 720x1280 ("upscale": "720p", the default; "none" keeps 480p)
+#   with the native SeedVR2 nodes of the installed ComfyUI core (d07dff45). No custom node, no package.
+# - New "mode": "upscale_only" (video_base64 / video_url / video_path): only the upscale.
+# - "upscale_model": "3b" (default) | "7b"; models from <volume>/models/upscale/, downloaded once from
+#   huggingface.co/Comfy-Org/SeedVR2 at a pinned revision (sha256 checked) when missing. 3B + VAE at startup,
+#   7B on first use.
+# - Upscale always in RAM-sized time segments, InfiniteTalk unloaded first, audio copied unchanged, frame count /
+#   fps / size / audio packets checked, frozen-frame check logged, OOM retries per segment only. An upscale
+#   failure returns the 480p video with "upscale": "failed".
+# - Jobs without "mode"/"upscale" queue exactly the same workflow as v1.0-stable (tests/test_v23_prompt_identity.py).
+# Replaces /handler.py, /setup_models.py and /worker_guard, adds /Upscale_SeedVR2.json. Installs nothing.
+FROM digamberjhazaran/infinitetalk-runpod:v25
+
+SHELL ["/bin/bash", "-c"]
+
+# 1. Baseline freeze + fingerprints of the files this image must NOT change; v25 handler/setup_models are the expected ones
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
+    echo "fb9464df80eb072bca90ffd5d2bcf7b83f1ec9915eb83c19ba4b6834d1d66f2f  /handler.py" | sha256sum -c --quiet && \
+    echo "990c405c580c4bb00db372a81c143d6ed40bb61331d316313c9d4e4ccf2f3454  /setup_models.py" | sha256sum -c --quiet && \
+    test ! -e /Upscale_SeedVR2.json && \
+    command -v ffmpeg && command -v ffprobe && \
+    sha256sum /entrypoint.sh /extra_model_paths.yaml /I2V_single.json /I2V_multi.json /V2V_single.json /V2V_multi.json \
+        /I2V_single_compiled.json /I2V_multi_compiled.json > /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes.sha256 && \
+    find /ComfyUI/comfy /ComfyUI/comfy_extras -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum > /tmp/comfy_core.sha256
+
+# 2. New worker_guard (whole folder replaced so no stale module survives), handler, setup_models, upscale workflow
+RUN rm -rf /worker_guard
+COPY worker_guard/ /worker_guard/
+COPY handler.py /handler.py
+COPY setup_models.py /setup_models.py
+COPY Upscale_SeedVR2.json /Upscale_SeedVR2.json
+RUN find /worker_guard -name '*.py' -exec sed -i 's/\r$//' {} + && \
+    sed -i 's/\r$//' /handler.py /setup_models.py && \
+    rm -rf /worker_guard/__pycache__ && \
+    grep -q "install_job_guard(handler, get_videos)" /handler.py && \
+    grep -q "final_offload_check(prompt)" /handler.py && \
+    grep -q '"class_type": "WanVideoApplyNAG"' /handler.py && \
+    grep -q '_return_video_file' /handler.py && \
+    /usr/bin/python3.10 -m py_compile /handler.py /setup_models.py && rm -rf /__pycache__ && \
+    /usr/bin/python3.10 -c "import json; json.load(open('/Upscale_SeedVR2.json'))" && \
+    cd / && python -c "import worker_guard.job_guard, worker_guard.upscale, worker_guard.modes, setup_models; \
+print('worker_guard + upscale import OK')" && \
+    rm -rf /worker_guard/__pycache__ /__pycache__
+
+# 3. Smoke check against the installed ComfyUI (CPU, throwaway copy, placeholder model files): every node is
+#    registered and every upscale prompt variant passes ComfyUI's own /prompt validation. Nothing is written.
+COPY scripts/smoke_v26.py /tmp/smoke_v26.py
+RUN cd / && PYTHONDONTWRITEBYTECODE=1 timeout 900 /usr/bin/python3.10 /tmp/smoke_v26.py / && \
+    rm -f /tmp/smoke_v26.py && rm -rf /worker_guard/__pycache__ /__pycache__
+
+# 4. LAST RUN STEP: unchanged files + unchanged custom nodes + unchanged ComfyUI core + zero package drift
+RUN sha256sum -c --quiet /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 \
+        | sort -z | xargs -0 sha256sum > /tmp/custom_nodes_post.sha256 && \
+    diff -u /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
+    find /ComfyUI/comfy /ComfyUI/comfy_extras -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum > /tmp/comfy_core_post.sha256 && \
+    diff -u /tmp/comfy_core.sha256 /tmp/comfy_core_post.sha256 && \
+    /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "CRITICAL ERROR: files, custom nodes, ComfyUI core or the Python environment changed during the v26 build!"; \
+        exit 1; \
+    } && \
+    rm -f /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt /tmp/unchanged.sha256 /tmp/custom_nodes.sha256 \
+        /tmp/custom_nodes_post.sha256 /tmp/comfy_core.sha256 /tmp/comfy_core_post.sha256 && \
+    echo "OK: entrypoint/workflows/custom nodes/ComfyUI core unchanged. Zero package drift."

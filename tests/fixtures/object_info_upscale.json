@@ -1,0 +1,1374 @@
+{
+ "ImageScale": {
+  "input": {
+   "required": {
+    "crop": [
+     [
+      "disabled",
+      "center"
+     ]
+    ],
+    "height": [
+     "INT",
+     {
+      "default": 512,
+      "max": 16384,
+      "min": 0,
+      "step": 1
+     }
+    ],
+    "image": [
+     "IMAGE"
+    ],
+    "upscale_method": [
+     [
+      "nearest-exact",
+      "bilinear",
+      "area",
+      "bicubic",
+      "lanczos"
+     ]
+    ],
+    "width": [
+     "INT",
+     {
+      "default": 512,
+      "max": 16384,
+      "min": 0,
+      "step": 1
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "image",
+    "upscale_method",
+    "width",
+    "height",
+    "crop"
+   ]
+  },
+  "output": [
+   "IMAGE"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "IMAGE"
+  ]
+ },
+ "KSampler": {
+  "input": {
+   "required": {
+    "cfg": [
+     "FLOAT",
+     {
+      "default": 8.0,
+      "max": 100.0,
+      "min": 0.0,
+      "round": 0.01,
+      "step": 0.1,
+      "tooltip": "The Classifier-Free Guidance scale balances creativity and adherence to the prompt. Higher values result in images more closely matching the prompt however too high values will negatively impact quality."
+     }
+    ],
+    "denoise": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "max": 1.0,
+      "min": 0.0,
+      "step": 0.01,
+      "tooltip": "The amount of denoising applied, lower values will maintain the structure of the initial image allowing for image to image sampling."
+     }
+    ],
+    "latent_image": [
+     "LATENT",
+     {
+      "tooltip": "The latent image to denoise."
+     }
+    ],
+    "model": [
+     "MODEL",
+     {
+      "tooltip": "The model used for denoising the input latent."
+     }
+    ],
+    "negative": [
+     "CONDITIONING",
+     {
+      "tooltip": "The conditioning describing the attributes you want to exclude from the image."
+     }
+    ],
+    "positive": [
+     "CONDITIONING",
+     {
+      "tooltip": "The conditioning describing the attributes you want to include in the image."
+     }
+    ],
+    "sampler_name": [
+     [
+      "euler",
+      "euler_cfg_pp",
+      "euler_ancestral",
+      "euler_ancestral_cfg_pp",
+      "heun",
+      "heunpp2",
+      "exp_heun_2_x0",
+      "exp_heun_2_x0_sde",
+      "dpm_2",
+      "dpm_2_ancestral",
+      "lms",
+      "dpm_fast",
+      "dpm_adaptive",
+      "dpmpp_2s_ancestral",
+      "dpmpp_2s_ancestral_cfg_pp",
+      "dpmpp_sde",
+      "dpmpp_sde_gpu",
+      "dpmpp_2m",
+      "dpmpp_2m_cfg_pp",
+      "dpmpp_2m_sde",
+      "dpmpp_2m_sde_gpu",
+      "dpmpp_2m_sde_heun",
+      "dpmpp_2m_sde_heun_gpu",
+      "dpmpp_3m_sde",
+      "dpmpp_3m_sde_gpu",
+      "ddpm",
+      "lcm",
+      "ipndm",
+      "ipndm_v",
+      "deis",
+      "cfgpp_ud10_ab",
+      "res_multistep",
+      "res_multistep_cfg_pp",
+      "res_multistep_ancestral",
+      "res_multistep_ancestral_cfg_pp",
+      "gradient_estimation",
+      "gradient_estimation_cfg_pp",
+      "er_sde",
+      "seeds_2",
+      "seeds_3",
+      "sa_solver",
+      "sa_solver_pece",
+      "ddim",
+      "uni_pc",
+      "uni_pc_bh2"
+     ],
+     {
+      "tooltip": "The algorithm used when sampling, this can affect the quality, speed, and style of the generated output."
+     }
+    ],
+    "scheduler": [
+     [
+      "simple",
+      "sgm_uniform",
+      "karras",
+      "exponential",
+      "ddim_uniform",
+      "beta",
+      "normal",
+      "linear_quadratic",
+      "kl_optimal"
+     ],
+     {
+      "tooltip": "The scheduler controls how noise is gradually removed to form the image."
+     }
+    ],
+    "seed": [
+     "INT",
+     {
+      "control_after_generate": true,
+      "default": 0,
+      "max": 18446744073709551615,
+      "min": 0,
+      "tooltip": "The random seed used for creating the noise."
+     }
+    ],
+    "steps": [
+     "INT",
+     {
+      "default": 20,
+      "max": 10000,
+      "min": 1,
+      "tooltip": "The number of steps used in the denoising process."
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "seed",
+    "steps",
+    "cfg",
+    "sampler_name",
+    "scheduler",
+    "positive",
+    "negative",
+    "latent_image",
+    "denoise"
+   ]
+  },
+  "output": [
+   "LATENT"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "LATENT"
+  ]
+ },
+ "SeedVR2Conditioning": {
+  "input": {
+   "required": {
+    "model": [
+     "MODEL",
+     {
+      "tooltip": "The SeedVR2 model."
+     }
+    ],
+    "vae_conditioning": [
+     "LATENT",
+     {
+      "display_name": "latent"
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "vae_conditioning"
+   ]
+  },
+  "output": [
+   "CONDITIONING",
+   "CONDITIONING"
+  ],
+  "output_is_list": [
+   false,
+   false
+  ],
+  "output_name": [
+   "positive",
+   "negative"
+  ]
+ },
+ "SeedVR2PostProcessing": {
+  "input": {
+   "required": {
+    "color_correction_method": [
+     "COMBO",
+     {
+      "default": "lab",
+      "multiselect": false,
+      "options": [
+       "lab",
+       "wavelet",
+       "adain",
+       "none"
+      ],
+      "tooltip": "Method to match the generated image colors to the original image. lab: transfer color in CIELAB space, preserving detail (most faithful). wavelet: transfer low-frequency color, keeping upscaled high-frequency detail. adain: match per-channel mean/std (fastest, global tint). none: skip color transfer (geometry alignment only)."
+     }
+    ],
+    "images": [
+     "IMAGE",
+     {
+      "tooltip": "The generated image to process."
+     }
+    ],
+    "original_resized_images": [
+     "IMAGE",
+     {
+      "tooltip": "The original resized image before pre-processing, used as reference."
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "images",
+    "original_resized_images",
+    "color_correction_method"
+   ]
+  },
+  "output": [
+   "IMAGE"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "images"
+  ]
+ },
+ "SeedVR2Preprocess": {
+  "input": {
+   "required": {
+    "resized_images": [
+     "IMAGE",
+     {
+      "tooltip": "The resized image to process."
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "resized_images"
+   ]
+  },
+  "output": [
+   "IMAGE"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "images"
+  ]
+ },
+ "SeedVR2TemporalChunk": {
+  "input": {
+   "required": {
+    "chunking_mode": [
+     "COMFY_DYNAMICCOMBO_V3",
+     {
+      "options": [
+       {
+        "inputs": {
+         "required": {}
+        },
+        "key": "auto"
+       },
+       {
+        "inputs": {
+         "required": {
+          "frames_per_chunk": [
+           "INT",
+           {
+            "default": 21,
+            "max": 16384,
+            "min": 1,
+            "step": 4,
+            "tooltip": "Pixel frames per temporal chunk (4n+1: 1, 5, 9, 13, ...)."
+           }
+          ]
+         }
+        },
+        "key": "manual"
+       }
+      ],
+      "tooltip": "manual = use frames_per_chunk exactly; auto = predict the largest chunk that fits free VRAM."
+     }
+    ],
+    "latent": [
+     "LATENT",
+     {
+      "tooltip": "The VAE-encoded SeedVR2 latent to split."
+     }
+    ],
+    "temporal_overlap": [
+     "INT",
+     {
+      "default": 0,
+      "max": 16384,
+      "min": 0,
+      "tooltip": "Latent frames shared between adjacent chunks and crossfaded at merge; 0 = no overlap."
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "latent",
+    "temporal_overlap",
+    "chunking_mode"
+   ]
+  },
+  "output": [
+   "LATENT",
+   "INT"
+  ],
+  "output_is_list": [
+   true,
+   false
+  ],
+  "output_name": [
+   "latents",
+   "temporal_overlap"
+  ]
+ },
+ "SeedVR2TemporalMerge": {
+  "input": {
+   "required": {
+    "latents": [
+     "LATENT",
+     {
+      "tooltip": "The sampled temporal chunks in sequence order."
+     }
+    ],
+    "temporal_overlap": [
+     "INT",
+     {
+      "default": 0,
+      "forceInput": true,
+      "max": 16384,
+      "min": 0,
+      "tooltip": "The temporal_overlap output of Split SeedVR2 Latent. 0 = plain concatenation."
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "latents",
+    "temporal_overlap"
+   ]
+  },
+  "output": [
+   "LATENT"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "latent"
+  ]
+ },
+ "UNETLoader": {
+  "input": {
+   "required": {
+    "unet_name": [
+     []
+    ],
+    "weight_dtype": [
+     [
+      "default",
+      "fp8_e4m3fn",
+      "fp8_e4m3fn_fast",
+      "fp8_e5m2"
+     ],
+     {
+      "advanced": true
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "unet_name",
+    "weight_dtype"
+   ]
+  },
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "MODEL"
+  ]
+ },
+ "VAEDecodeTiled": {
+  "input": {
+   "required": {
+    "overlap": [
+     "INT",
+     {
+      "advanced": true,
+      "default": 64,
+      "max": 4096,
+      "min": 0,
+      "step": 32
+     }
+    ],
+    "samples": [
+     "LATENT"
+    ],
+    "temporal_overlap": [
+     "INT",
+     {
+      "advanced": true,
+      "default": 8,
+      "max": 4096,
+      "min": 4,
+      "step": 4,
+      "tooltip": "Only used for video VAEs: Amount of frames to overlap."
+     }
+    ],
+    "temporal_size": [
+     "INT",
+     {
+      "advanced": true,
+      "default": 64,
+      "max": 4096,
+      "min": 8,
+      "step": 4,
+      "tooltip": "Only used for video VAEs: Amount of frames to decode at a time."
+     }
+    ],
+    "tile_size": [
+     "INT",
+     {
+      "advanced": true,
+      "default": 512,
+      "max": 4096,
+      "min": 64,
+      "step": 32
+     }
+    ],
+    "vae": [
+     "VAE"
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "samples",
+    "vae",
+    "tile_size",
+    "overlap",
+    "temporal_size",
+    "temporal_overlap"
+   ]
+  },
+  "output": [
+   "IMAGE"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "IMAGE"
+  ]
+ },
+ "VAEEncodeTiled": {
+  "input": {
+   "required": {
+    "overlap": [
+     "INT",
+     {
+      "advanced": true,
+      "default": 64,
+      "max": 4096,
+      "min": 0,
+      "step": 32
+     }
+    ],
+    "pixels": [
+     "IMAGE"
+    ],
+    "temporal_overlap": [
+     "INT",
+     {
+      "advanced": true,
+      "default": 8,
+      "max": 4096,
+      "min": 4,
+      "step": 4,
+      "tooltip": "Only used for video VAEs: Amount of frames to overlap."
+     }
+    ],
+    "temporal_size": [
+     "INT",
+     {
+      "advanced": true,
+      "default": 64,
+      "max": 4096,
+      "min": 8,
+      "step": 4,
+      "tooltip": "Only used for video VAEs: Amount of frames to encode at a time."
+     }
+    ],
+    "tile_size": [
+     "INT",
+     {
+      "advanced": true,
+      "default": 512,
+      "max": 4096,
+      "min": 64,
+      "step": 64
+     }
+    ],
+    "vae": [
+     "VAE"
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "pixels",
+    "vae",
+    "tile_size",
+    "overlap",
+    "temporal_size",
+    "temporal_overlap"
+   ]
+  },
+  "output": [
+   "LATENT"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "LATENT"
+  ]
+ },
+ "VAELoader": {
+  "input": {
+   "required": {
+    "vae_name": [
+     [
+      "pixel_space"
+     ]
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "vae_name"
+   ]
+  },
+  "output": [
+   "VAE"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "VAE"
+  ]
+ },
+ "VHS_LoadVideoPath": {
+  "input": {
+   "hidden": {
+    "force_size": "STRING",
+    "unique_id": "UNIQUE_ID"
+   },
+   "optional": {
+    "format": [
+     [
+      "None",
+      "AnimateDiff",
+      "Mochi",
+      "LTXV",
+      "Hunyuan",
+      "Cosmos",
+      "Wan",
+      "H3"
+     ],
+     {
+      "default": "AnimateDiff",
+      "formats": {
+       "AnimateDiff": {
+        "dim": [
+         8,
+         0,
+         512,
+         512
+        ],
+        "target_rate": 8
+       },
+       "Cosmos": {
+        "dim": [
+         16,
+         0,
+         1280,
+         704
+        ],
+        "frames": [
+         8,
+         1
+        ],
+        "target_rate": 24
+       },
+       "H3": {
+        "dim": [
+         32,
+         0,
+         1344,
+         768
+        ],
+        "frames": [
+         17,
+         5
+        ],
+        "target_rate": 24
+       },
+       "Hunyuan": {
+        "dim": [
+         16,
+         0,
+         848,
+         480
+        ],
+        "frames": [
+         4,
+         1
+        ],
+        "target_rate": 24
+       },
+       "LTXV": {
+        "dim": [
+         32,
+         0,
+         768,
+         512
+        ],
+        "frames": [
+         8,
+         1
+        ],
+        "target_rate": 24
+       },
+       "Mochi": {
+        "dim": [
+         16,
+         0,
+         848,
+         480
+        ],
+        "frames": [
+         6,
+         1
+        ],
+        "target_rate": 24
+       },
+       "None": {},
+       "Wan": {
+        "dim": [
+         8,
+         0,
+         832,
+         480
+        ],
+        "frames": [
+         4,
+         1
+        ],
+        "target_rate": 16
+       }
+      }
+     }
+    ],
+    "meta_batch": [
+     "VHS_BatchManager"
+    ],
+    "vae": [
+     "VAE"
+    ]
+   },
+   "required": {
+    "custom_height": [
+     "INT",
+     {
+      "default": 0,
+      "disable": 0,
+      "max": 8192,
+      "min": 0
+     }
+    ],
+    "custom_width": [
+     "INT",
+     {
+      "default": 0,
+      "disable": 0,
+      "max": 8192,
+      "min": 0
+     }
+    ],
+    "force_rate": [
+     "FLOAT",
+     {
+      "default": 0,
+      "disable": 0,
+      "max": 60,
+      "min": 0,
+      "step": 1
+     }
+    ],
+    "frame_load_cap": [
+     "INT",
+     {
+      "default": 0,
+      "disable": 0,
+      "max": 9007199254740991,
+      "min": 0,
+      "step": 1
+     }
+    ],
+    "select_every_nth": [
+     "INT",
+     {
+      "default": 1,
+      "max": 9007199254740991,
+      "min": 1,
+      "step": 1
+     }
+    ],
+    "skip_first_frames": [
+     "INT",
+     {
+      "default": 0,
+      "max": 9007199254740991,
+      "min": 0,
+      "step": 1
+     }
+    ],
+    "video": [
+     "STRING",
+     {
+      "placeholder": "X://insert/path/here.mp4",
+      "vhs_path_extensions": [
+       "webm",
+       "mp4",
+       "mkv",
+       "gif",
+       "mov"
+      ]
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "hidden": [
+    "force_size",
+    "unique_id"
+   ],
+   "optional": [
+    "meta_batch",
+    "vae",
+    "format"
+   ],
+   "required": [
+    "video",
+    "force_rate",
+    "custom_width",
+    "custom_height",
+    "frame_load_cap",
+    "skip_first_frames",
+    "select_every_nth"
+   ]
+  },
+  "output": [
+   "IMAGE",
+   "INT",
+   "AUDIO",
+   "VHS_VIDEOINFO"
+  ],
+  "output_is_list": [
+   false,
+   false,
+   false,
+   false
+  ],
+  "output_name": [
+   "IMAGE",
+   "frame_count",
+   "audio",
+   "video_info"
+  ]
+ },
+ "VHS_VideoCombine": {
+  "input": {
+   "hidden": {
+    "extra_pnginfo": "EXTRA_PNGINFO",
+    "prompt": "PROMPT",
+    "unique_id": "UNIQUE_ID"
+   },
+   "optional": {
+    "audio": [
+     "AUDIO"
+    ],
+    "meta_batch": [
+     "VHS_BatchManager"
+    ],
+    "vae": [
+     "VAE"
+    ]
+   },
+   "required": {
+    "filename_prefix": [
+     "STRING",
+     {
+      "default": "AnimateDiff"
+     }
+    ],
+    "format": [
+     [
+      "image/gif",
+      "image/webp",
+      "video/nvenc_hevc-mp4",
+      "video/ffv1-mkv",
+      "video/nvenc_h264-mp4",
+      "video/h265-mp4",
+      "video/8bit-png",
+      "video/webm",
+      "video/ProRes",
+      "video/nvenc_av1-mp4",
+      "video/16bit-png",
+      "video/ffmpeg-gif",
+      "video/h264-mp4",
+      "video/av1-webm"
+     ],
+     {
+      "formats": {
+       "image/webp": [
+        [
+         "lossless",
+         "BOOLEAN",
+         {
+          "default": true
+         }
+        ]
+       ],
+       "video/ProRes": [
+        [
+         "profile",
+         [
+          "lt",
+          "standard",
+          "hq",
+          "4444",
+          "4444xq"
+         ],
+         {
+          "default": "hq"
+         }
+        ]
+       ],
+       "video/av1-webm": [
+        [
+         "pix_fmt",
+         [
+          "yuv420p10le",
+          "yuv420p"
+         ]
+        ],
+        [
+         "crf",
+         "INT",
+         {
+          "default": 23,
+          "max": 100,
+          "min": 0,
+          "step": 1
+         }
+        ],
+        [
+         "input_color_depth",
+         [
+          "8bit",
+          "16bit"
+         ]
+        ],
+        [
+         "save_metadata",
+         "BOOLEAN",
+         {
+          "default": true
+         }
+        ]
+       ],
+       "video/ffmpeg-gif": [
+        [
+         "dither",
+         [
+          "bayer",
+          "heckbert",
+          "floyd_steinberg",
+          "sierra2",
+          "sierra2_4a",
+          "sierra3",
+          "burkes",
+          "atkinson",
+          "none"
+         ],
+         {
+          "default": "sierra2_4a"
+         },
+         "[0:v] split [a][b]; [a] palettegen=reserve_transparent=on:transparency_color=ffffff [p]; [b][p] paletteuse=dither=$val"
+        ]
+       ],
+       "video/ffv1-mkv": [
+        [
+         "level",
+         [
+          "0",
+          "1",
+          "3"
+         ],
+         {
+          "default": "3"
+         }
+        ],
+        [
+         "coder",
+         [
+          "0",
+          "1",
+          "2"
+         ],
+         {
+          "default": "1"
+         }
+        ],
+        [
+         "context",
+         [
+          "0",
+          "1"
+         ],
+         {
+          "default": "1"
+         }
+        ],
+        [
+         "gop_size",
+         "INT",
+         {
+          "default": 1,
+          "max": 300,
+          "min": 1,
+          "step": 1
+         }
+        ],
+        [
+         "slices",
+         [
+          "4",
+          "6",
+          "9",
+          "12",
+          "16",
+          "20",
+          "24",
+          "30"
+         ],
+         {
+          "default": "16"
+         }
+        ],
+        [
+         "slicecrc",
+         [
+          "0",
+          "1"
+         ],
+         {
+          "default": "1"
+         }
+        ],
+        [
+         "pix_fmt",
+         [
+          "rgba64le",
+          "bgra",
+          "yuv420p",
+          "yuv422p",
+          "yuv444p",
+          "yuva420p",
+          "yuva422p",
+          "yuva444p",
+          "yuv420p10le",
+          "yuv422p10le",
+          "yuv444p10le",
+          "yuv420p12le",
+          "yuv422p12le",
+          "yuv444p12le",
+          "yuv420p14le",
+          "yuv422p14le",
+          "yuv444p14le",
+          "yuv420p16le",
+          "yuv422p16le",
+          "yuv444p16le",
+          "gray",
+          "gray10le",
+          "gray12le",
+          "gray16le"
+         ],
+         {
+          "default": "rgba64le"
+         }
+        ],
+        [
+         "save_metadata",
+         "BOOLEAN",
+         {
+          "default": true
+         }
+        ],
+        [
+         "trim_to_audio",
+         "BOOLEAN",
+         {
+          "default": false
+         }
+        ]
+       ],
+       "video/h264-mp4": [
+        [
+         "pix_fmt",
+         [
+          "yuv420p",
+          "yuv420p10le"
+         ]
+        ],
+        [
+         "crf",
+         "INT",
+         {
+          "default": 19,
+          "max": 100,
+          "min": 0,
+          "step": 1
+         }
+        ],
+        [
+         "save_metadata",
+         "BOOLEAN",
+         {
+          "default": true
+         }
+        ],
+        [
+         "trim_to_audio",
+         "BOOLEAN",
+         {
+          "default": false
+         }
+        ]
+       ],
+       "video/h265-mp4": [
+        [
+         "pix_fmt",
+         [
+          "yuv420p10le",
+          "yuv420p"
+         ]
+        ],
+        [
+         "crf",
+         "INT",
+         {
+          "default": 22,
+          "max": 100,
+          "min": 0,
+          "step": 1
+         }
+        ],
+        [
+         "save_metadata",
+         "BOOLEAN",
+         {
+          "default": true
+         }
+        ]
+       ],
+       "video/nvenc_av1-mp4": [
+        [
+         "pix_fmt",
+         [
+          "yuv420p",
+          "p010le"
+         ]
+        ],
+        [
+         "bitrate",
+         "INT",
+         {
+          "default": 10,
+          "max": 999,
+          "min": 1,
+          "step": 1
+         }
+        ],
+        [
+         "megabit",
+         "BOOLEAN",
+         {
+          "default": true
+         }
+        ],
+        [
+         "save_metadata",
+         "BOOLEAN",
+         {
+          "default": true
+         }
+        ]
+       ],
+       "video/nvenc_h264-mp4": [
+        [
+         "pix_fmt",
+         [
+          "yuv420p",
+          "p010le"
+         ]
+        ],
+        [
+         "bitrate",
+         "INT",
+         {
+          "default": 10,
+          "max": 999,
+          "min": 1,
+          "step": 1
+         }
+        ],
+        [
+         "megabit",
+         "BOOLEAN",
+         {
+          "default": true
+         }
+        ],
+        [
+         "save_metadata",
+         "BOOLEAN",
+         {
+          "default": true
+         }
+        ]
+       ],
+       "video/nvenc_hevc-mp4": [
+        [
+         "pix_fmt",
+         [
+          "yuv420p",
+          "p010le"
+         ]
+        ],
+        [
+         "bitrate",
+         "INT",
+         {
+          "default": 10,
+          "max": 999,
+          "min": 1,
+          "step": 1
+         }
+        ],
+        [
+         "megabit",
+         "BOOLEAN",
+         {
+          "default": true
+         }
+        ],
+        [
+         "save_metadata",
+         "BOOLEAN",
+         {
+          "default": true
+         }
+        ]
+       ],
+       "video/webm": [
+        [
+         "pix_fmt",
+         [
+          "yuv420p",
+          "yuva420p"
+         ]
+        ],
+        [
+         "crf",
+         "INT",
+         {
+          "default": 20,
+          "max": 100,
+          "min": 0,
+          "step": 1
+         }
+        ],
+        [
+         "save_metadata",
+         "BOOLEAN",
+         {
+          "default": true
+         }
+        ],
+        [
+         "trim_to_audio",
+         "BOOLEAN",
+         {
+          "default": false
+         }
+        ]
+       ]
+      }
+     }
+    ],
+    "frame_rate": [
+     "FLOAT",
+     {
+      "default": 8,
+      "min": 1,
+      "step": 1
+     }
+    ],
+    "images": [
+     "IMAGE"
+    ],
+    "loop_count": [
+     "INT",
+     {
+      "default": 0,
+      "max": 100,
+      "min": 0,
+      "step": 1
+     }
+    ],
+    "pingpong": [
+     "BOOLEAN",
+     {
+      "default": false
+     }
+    ],
+    "save_output": [
+     "BOOLEAN",
+     {
+      "default": true
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "hidden": [
+    "prompt",
+    "extra_pnginfo",
+    "unique_id"
+   ],
+   "optional": [
+    "audio",
+    "meta_batch",
+    "vae"
+   ],
+   "required": [
+    "images",
+    "frame_rate",
+    "loop_count",
+    "filename_prefix",
+    "format",
+    "pingpong",
+    "save_output"
+   ]
+  },
+  "output": [
+   "VHS_FILENAMES"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "Filenames"
+  ]
+ },
+ "_source": "GET /object_info/<node> from image digamberjhazaran/infinitetalk-runpod:v25 (ComfyUI d07dff45, VideoHelperSuite 4d907be), ComfyUI started with --cpu and no model files (model combos are empty)"
+}

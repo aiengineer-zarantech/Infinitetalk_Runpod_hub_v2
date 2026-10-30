@@ -357,11 +357,14 @@ def handler(job):
         return {"cmd": cmd, "output": output}
 
     # v24 job modes ("mode": "fast480" sets the size); a job without "mode" is not changed
-    from worker_guard.modes import prepare_job_input
+    from worker_guard.modes import prepare_job_input, job_mode, UPSCALE_ONLY
     job_input, mode_error = prepare_job_input(job_input)
     if mode_error:
         logger.error(mode_error)
         return {"error": mode_error}
+    if job_mode(job_input) == UPSCALE_ONLY:
+        # v26: worker_guard runs upscale_only jobs itself; they never reach this handler with the guard on
+        return {"error": "[MODE] upscale_only needs the worker guard (WORKER_GUARD_ENABLED=1)"}
 
     # job_input을 로깅할 때 base64 데이터는 truncate해서 출력
     log_input = job_input.copy()
@@ -778,7 +781,11 @@ def handler(job):
                     f"⚠️ 파일 크기가 일치하지 않습니다: 원본={source_file_size}, 복사본={copied_file_size}"
                 )
 
-            return {"video_path": output_path}
+            result = {"video_path": output_path}
+            if job_input.get("_return_video_file"):
+                # v26: the 480p file for the upscale stage (worker_guard removes this key)
+                result["_video_file"] = output_video_path
+            return result
 
         except Exception as e:
             logger.error(f"❌ 비디오 복사 실패: {e}")
@@ -802,7 +809,11 @@ def handler(job):
             logger.info(
                 f"✅ Base64 인코딩된 비디오 반환: {truncate_base64_for_log(video_data)}"
             )
-            return {"video": video_data}
+            result = {"video": video_data}
+            if job_input.get("_return_video_file"):
+                # v26: the 480p file for the upscale stage (worker_guard removes this key)
+                result["_video_file"] = output_video_path
+            return result
 
         except Exception as e:
             logger.error(f"❌ Base64 인코딩 실패: {e}")

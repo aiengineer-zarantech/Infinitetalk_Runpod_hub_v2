@@ -350,7 +350,7 @@ def test_vram_stage_line_and_final_job_line(mocked_comfy, monkeypatch, caplog):
     from worker_guard import comfy_api
     monkeypatch.setattr(comfy_api, "vram_stages", lambda timeout=5: VRAM_SNAPSHOT)
     caplog.set_level(logging.INFO, logger="worker_guard")
-    handler.handler(job(mode="fast480"))
+    handler.handler(job(mode="fast480", upscale="none"))  # v26: upscale covered in test_upscale_job.py
     assert ("[VRAM] vram peak sampler 18.4 GB, vae 21.6 GB, headroom 10.4 GB (other nodes 9.5 GB; 812 samples every "
             "50 ms)") in caplog.messages
     final = [m for m in caplog.messages if m.startswith("[JOB] fast480")]

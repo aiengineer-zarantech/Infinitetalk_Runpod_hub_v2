@@ -35,3 +35,5 @@ payloads/step2/step2d_measure_25_blocks.json
 
 # fast480 phase payloads contain the test image and voice as base64: rebuild with scripts/make_fast480_payloads.py
 payloads/phase*/
+# v26 upscale payloads (video / image / audio as base64): rebuild with scripts/make_upscale_payloads.py
+payloads/v26/

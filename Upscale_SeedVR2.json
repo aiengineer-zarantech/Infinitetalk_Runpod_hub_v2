@@ -1,0 +1,139 @@
+{
+  "1": {
+    "inputs": {
+      "video": "",
+      "force_rate": 0,
+      "custom_width": 0,
+      "custom_height": 0,
+      "frame_load_cap": 0,
+      "skip_first_frames": 0,
+      "select_every_nth": 1,
+      "format": "None"
+    },
+    "class_type": "VHS_LoadVideoPath",
+    "_meta": {"title": "Load segment (480p source)"}
+  },
+  "2": {
+    "inputs": {
+      "image": ["1", 0],
+      "upscale_method": "lanczos",
+      "width": 1280,
+      "height": 720,
+      "crop": "center"
+    },
+    "class_type": "ImageScale",
+    "_meta": {"title": "Resize to target (center crop to exact aspect)"}
+  },
+  "3": {
+    "inputs": {
+      "resized_images": ["2", 0]
+    },
+    "class_type": "SeedVR2Preprocess",
+    "_meta": {"title": "Pre-Process SeedVR2 Input"}
+  },
+  "4": {
+    "inputs": {
+      "vae_name": "seedvr2_ema_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {"title": "SeedVR2 VAE"}
+  },
+  "5": {
+    "inputs": {
+      "pixels": ["3", 0],
+      "vae": ["4", 0],
+      "tile_size": 512,
+      "overlap": 128,
+      "temporal_size": 64,
+      "temporal_overlap": 8
+    },
+    "class_type": "VAEEncodeTiled",
+    "_meta": {"title": "VAE Encode (Tiled)"}
+  },
+  "6": {
+    "inputs": {
+      "latent": ["5", 0],
+      "temporal_overlap": 1,
+      "chunking_mode": "auto"
+    },
+    "class_type": "SeedVR2TemporalChunk",
+    "_meta": {"title": "Split SeedVR2 Latent"}
+  },
+  "7": {
+    "inputs": {
+      "unet_name": "seedvr2_3b_fp16.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {"title": "SeedVR2 model"}
+  },
+  "8": {
+    "inputs": {
+      "model": ["7", 0],
+      "vae_conditioning": ["6", 0]
+    },
+    "class_type": "SeedVR2Conditioning",
+    "_meta": {"title": "Apply SeedVR2 Conditioning"}
+  },
+  "9": {
+    "inputs": {
+      "model": ["7", 0],
+      "positive": ["8", 0],
+      "negative": ["8", 1],
+      "latent_image": ["6", 0],
+      "seed": 42,
+      "steps": 1,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0
+    },
+    "class_type": "KSampler",
+    "_meta": {"title": "KSampler (SeedVR2 one step)"}
+  },
+  "10": {
+    "inputs": {
+      "latents": ["9", 0],
+      "temporal_overlap": ["6", 1]
+    },
+    "class_type": "SeedVR2TemporalMerge",
+    "_meta": {"title": "Merge SeedVR2 Latents"}
+  },
+  "11": {
+    "inputs": {
+      "samples": ["10", 0],
+      "vae": ["4", 0],
+      "tile_size": 512,
+      "overlap": 128,
+      "temporal_size": 64,
+      "temporal_overlap": 8
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": {"title": "VAE Decode (Tiled)"}
+  },
+  "12": {
+    "inputs": {
+      "images": ["11", 0],
+      "original_resized_images": ["2", 0],
+      "color_correction_method": "lab"
+    },
+    "class_type": "SeedVR2PostProcessing",
+    "_meta": {"title": "Post-Process SeedVR2 Output"}
+  },
+  "13": {
+    "inputs": {
+      "images": ["12", 0],
+      "frame_rate": 25,
+      "loop_count": 0,
+      "filename_prefix": "SeedVR2_segment",
+      "format": "video/ffv1-mkv",
+      "pix_fmt": "yuv444p",
+      "save_metadata": false,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": false
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {"title": "Lossless segment (no audio)"}
+  }
+}

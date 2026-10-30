@@ -57,6 +57,20 @@ def free(unload_models=True, free_memory=True, timeout=10):
         response.read()
 
 
+def queue(prompt, client_id, timeout=30):
+    """POST /prompt. Returns ComfyUI's answer ({"prompt_id": ..., "node_errors": {...}})."""
+    body = json.dumps({"prompt": prompt, "client_id": client_id}).encode("utf-8")
+    req = urllib.request.Request(base_url() + "/prompt", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read())
+
+
+def history(prompt_id, timeout=10):
+    """GET /history/<prompt_id>: {} while the prompt is still queued or running."""
+    return _get_json(f"/history/{urllib.parse.quote(prompt_id)}", timeout)
+
+
 def vram_stages(timeout=5):
     """GET /worker/vram (zz_worker_vram package): per-stage VRAM peaks of the last prompt."""
     return _get_json("/worker/vram", timeout)

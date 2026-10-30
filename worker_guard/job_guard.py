@@ -17,7 +17,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from worker_guard import accel, comfy_api, modes, offload, sysmem
+from worker_guard import accel, comfy_api, modes, offload, sysmem, upscale
 from worker_guard.node_timer import NodeTimer
 from worker_guard.speed import SpeedTracker
 
@@ -169,6 +169,9 @@ class JobContext:
         self.fp8_fast = False
         self.speed = None
         self.nodes = None
+        self.upscale_sec = None
+        self.upscale_vram = None
+        self.upscale_out = None
         self.lock = threading.Lock()
 
     def note_vram(self, used_bytes):
@@ -717,13 +720,18 @@ def _log_final_job_line(ctx, result):
     vram peak sampler A GB / vae B GB / upscale C GB"""
     ok = isinstance(result, dict) and not result.get("error")
     res = "n/a" if ctx.width is None or ctx.height is None else f"{ctx.width}x{ctx.height}"
+    if ctx.upscale_out:
+        res += f" -> {ctx.upscale_out[0]}x{ctx.upscale_out[1]}"
     gen = "n/a" if ctx.gen_sec is None else f"{ctx.gen_sec:.1f}s"
+    up = "n/a" if ctx.upscale_sec is None else f"{ctx.upscale_sec:.1f}s"
+    if ctx.upscale_sec is not None and not ctx.upscale_out:
+        up += " (failed)"
     sampler, vae, _ = _stage_peaks(ctx.vram)
     blocks = ctx.offload.blocks_to_swap if ctx.offload else "n/a"
     logger.info(
-        f"[JOB] {ctx.mode} {'done' if ok else 'failed'}: res {res}, gen {gen}, upscale n/a, "
+        f"[JOB] {ctx.mode} {'done' if ok else 'failed'}: res {res}, gen {gen}, upscale {up}, "
         f"total {_now() - ctx.started:.1f}s, attention {ctx.attention or 'n/a'}, blocks_to_swap {blocks}, "
-        f"vram peak sampler {_gb_or_na(sampler)} / vae {_gb_or_na(vae)} / upscale n/a"
+        f"vram peak sampler {_gb_or_na(sampler)} / vae {_gb_or_na(vae)} / upscale {_gb_or_na(ctx.upscale_vram)}"
     )
 
 
@@ -795,6 +803,106 @@ def _end_of_video_job(ctx, result):
             _resident_used = device["vram_used"]
     except Exception:
         pass
+
+
+def _deliver(path, network_volume, task_id):
+    """The upscale_only result, like handler.py returns a video: base64, or a copy on the network volume."""
+    import base64
+    import shutil
+    try:
+        if network_volume:
+            target = f"/runpod-volume/infinitetalk_{task_id}.mp4"
+            shutil.copy2(path, target)
+            return {"video_path": target}
+        with open(path, "rb") as f:
+            return {"video": base64.b64encode(f.read()).decode("utf-8")}
+    finally:
+        _remove_quietly(path)
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _run_upscale(ctx, source_path, settings, job_input, out_path):
+    """Frees InfiniteTalk, upscales, frees SeedVR2. Returns (upscale.Result or None, error message or None)."""
+    logger.info("[UPSCALE] unloading the generation models before the upscale")
+    _free_vram(ctx)
+    started = _now()
+    try:
+        up = upscale.run(source_path, settings["model"], out_path, ctx.remaining, job_input)
+        ctx.upscale_out = up.out_size
+        ctx.upscale_vram = up.vram_peak
+        return up, None
+    except upscale.UpscaleError as e:
+        return None, str(e)
+    except Exception as e:
+        logger.exception("[UPSCALE] unexpected error")
+        return None, f"{type(e).__name__}: {e}"
+    finally:
+        ctx.upscale_sec = _now() - started
+        # SeedVR2 out of the VRAM: the next job starts clean (InfiniteTalk loads fresh)
+        _free_vram(ctx)
+
+
+def _upscale_after_generation(ctx, result, settings, job_input):
+    """fast480: replaces the 480p video by the 720p one. On any upscale failure the 480p video is
+    returned with "upscale": "failed" (the generation is never re-run for it)."""
+    out = {k: v for k, v in result.items() if k != "_video_file"}
+    source = result.get("_video_file")
+    if not source or not os.path.isfile(source):
+        out.update(upscale="failed", upscale_error="the 480p file of the generation was not found")
+        logger.error(f"[UPSCALE] failed: {out['upscale_error']}; returning the 480p video")
+        return out
+    out_path = os.path.join(upscale.OUTPUT_DIR, f"upscaled_{os.path.splitext(os.path.basename(source))[0]}.mp4")
+    up, error = _run_upscale(ctx, source, settings, job_input, out_path)
+    if error:
+        logger.error(f"[UPSCALE] failed: {error}; returning the 480p video")
+        out.update(upscale="failed", upscale_error=error[:1000])
+        return out
+    try:
+        if "video_path" in out:
+            import shutil
+            shutil.copy2(up.path, out["video_path"])
+        else:
+            import base64
+            with open(up.path, "rb") as f:
+                out["video"] = base64.b64encode(f.read()).decode("utf-8")
+    except Exception as e:
+        logger.error(f"[UPSCALE] could not return the 720p video ({type(e).__name__}: {e}); returning the 480p video")
+        ctx.upscale_out = None
+        out.update(upscale="failed", upscale_error=f"{type(e).__name__}: {e}")
+        return out
+    finally:
+        _remove_quietly(up.path)
+    out["upscale"] = "720p"
+    return out
+
+
+def _upscale_only(ctx, job_input):
+    import uuid
+    task_id = f"task_{uuid.uuid4()}"
+    settings = modes.upscale_settings(job_input)
+    try:
+        source = upscale.save_input_video(job_input, task_id)
+        probe = upscale.probe(source)
+        ctx.width, ctx.height, ctx.frames = probe.width, probe.height, probe.frames
+    except upscale.UpscaleError as e:
+        message = f"[UPSCALE] input video: {e}"
+        logger.error(message)
+        return {"error": message}
+    out_path = os.path.join(upscale.OUTPUT_DIR, f"upscaled_{task_id}.mp4")
+    up, error = _run_upscale(ctx, source, settings, job_input, out_path)
+    if not job_input.get("video_path"):
+        _remove_quietly(source)  # our own copy of the base64 / URL input
+    if error:
+        message = f"[UPSCALE] failed: {error}"
+        logger.error(message)
+        return {"error": message[:1500]}
+    return _deliver(up.path, job_input.get("network_volume", False), task_id)
 
 
 def final_offload_check(prompt):
@@ -879,6 +987,13 @@ def install(handler, get_videos):
                 result = {"error": mode_error}
                 return result
             ctx.mode = modes.job_mode(job_input)
+            # v26: "upscale_only" runs no generation; fast480 jobs are upscaled after it ("upscale": "720p")
+            if ctx.mode == modes.UPSCALE_ONLY:
+                result = _upscale_only(ctx, job_input)
+                return result
+            upscale_settings = modes.upscale_settings(job_input)
+            if upscale_settings:
+                job_input = {**job_input, "_return_video_file": True}
             job = {**job, "input": job_input}
             _jobs_on_worker += 1
             ctx.job_number = _jobs_on_worker
@@ -933,12 +1048,19 @@ def install(handler, get_videos):
                 result = run({**job, "input": offload.apply(job_input, decision)})
             if decision.mode == "auto" and not ctx.trip_kind and offload.is_oom(result):
                 result = _oom_ladder(ctx, decision, job, job_input, result, run)
+            if isinstance(result, dict) and "_video_file" in result:
+                if upscale_settings and not ctx.trip_kind and not result.get("error"):
+                    result = _upscale_after_generation(ctx, result, upscale_settings, job_input)
+                else:
+                    result = {k: v for k, v in result.items() if k != "_video_file"}
             return result
         finally:
             _current = None
             _log_job_line(ctx, result)
             if task != "tts" and ctx.offload is not None:
                 _end_of_video_job(ctx, result)
+            elif ctx.mode == modes.UPSCALE_ONLY:
+                _log_final_job_line(ctx, result)
 
     @functools.wraps(get_videos)
     def monitored_get_videos(ws, prompt, input_type="image", person_count="single"):

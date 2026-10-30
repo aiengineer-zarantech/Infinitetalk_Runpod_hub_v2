@@ -431,3 +431,92 @@ $a | ConvertTo-Json -Depth 10 | Set-Content payloads\nag_b_on.json -Encoding utf
 - B vs A: less head shaking, nodding and swaying; lip sync and face identity unchanged; note the generation time
   difference (NAG adds one extra cross-attention per block, no extra sampler pass).
 - If B looks stiff or over-corrected, try `"nag_scale": 7`; if motion is still too strong, try 15.
+
+## v26: fast480 + SeedVR2 720p upscale, upscale_only
+
+`"mode": "fast480"` now generates at 848x480 / 480x848 and then upscales to exactly 1280x720 / 720x1280 with
+SeedVR2 (the native nodes of the installed ComfyUI core, no new package). `"mode": "upscale_only"` runs only the
+upscale on an existing video. Jobs without `mode` / `upscale` are unchanged (`tests/test_v23_prompt_identity.py`).
+
+How the stage works (worker_guard/upscale.py):
+1. InfiniteTalk is unloaded (`/free`, wait until VRAM is near zero).
+2. The video is upscaled in time segments sized from the container RAM. Each segment loads 8 extra frames on each
+   side for context, only its core frames are kept. One ComfyUI prompt per segment (`Upscale_SeedVR2.json`).
+3. ffmpeg joins the core frames (H.264 crf 19, yuv420p) and copies the source audio unchanged (`-c:a copy`).
+4. Checks: every segment returns exactly the frames it was given; the result has the source's frame count, frame
+   rate and audio packets and exactly the target size. Any difference fails the upscale.
+5. Frozen-frame check (log only), then SeedVR2 is unloaded too.
+
+If the upscale fails (out of memory after 3 smaller retries of that segment, time limit, failed check), a fast480 job
+still returns its 480p video with `"upscale": "failed"` and `"upscale_error"`. InfiniteTalk is never re-run for it.
+A successful fast480 job returns `"upscale": "720p"` next to `"video"`.
+
+### Endpoint
+
+- Image: `digamberjhazaran/infinitetalk-runpod:v26`, digest `<filled in after the push>`
+- Same test endpoint settings as Phase A (RTX 5090, execution timeout 3900 s, `RUNPOD_EXECUTION_TIMEOUT_SEC=3900`).
+- Volume: SeedVR2 files go to `/runpod-volume/models/upscale/`. If they are not there, the worker downloads them once
+  from `huggingface.co/Comfy-Org/SeedVR2` (revision `df48879`, sha256 checked):
+  - 3B fp16 (6.8 GB) + VAE (0.5 GB) during the first startup (that cold start takes longer once),
+  - 7B fp16 (16.5 GB) during the first job that asks for it (that job takes longer once).
+  Local disk needs about 7.3 GB more, plus 16.5 GB once 7B is used.
+
+### Payloads
+
+Pick an existing 480p InfiniteTalk clip (848x480, with audio) and a 15-20 s voice:
+
+```powershell
+python scripts\make_upscale_payloads.py --video clip480.mp4 --seconds 10 --image face.jpeg --audio voice_18s.wav
+.\scripts\run_runpod_job.ps1 -EndpointId <test-endpoint-id> -Payload payloads\v26\u1_upscale_only_3b.json -Out u1_upscale_only_3b.json
+```
+
+(`--seconds` needs ffmpeg on PATH; otherwise cut the clip yourself. `--from <payload>` instead of `--image` +
+`--audio` reuses that payload's image, audio and prompt.)
+
+### Test order
+
+1. **u1_upscale_only_3b.json** (10 s existing clip, 3B). This decides whether SeedVR2 is usable for talking heads.
+2. **u2_upscale_only_7b.json** (same clip, 7B). First 7B job downloads/copies the model.
+3. **u3_fast480_16x9.json**, then **u4_fast480_9x16.json** (full jobs: generation + upscale).
+4. Step 3 comparison (direct 720p vs 480p + upscale vs 480p): payloads and compare script come with Step 3.
+
+### Log lines to look for
+
+```
+[UPSCALE] source 848x480, 250 frames at 25/1 fps, audio yes -> 1280x720, model seedvr2_3b_fp16.safetensors
+[UPSCALE] models ready in 2.1s: seedvr2_3b_fp16.safetensors, seedvr2_ema_vae_fp16.safetensors
+[UPSCALE] segments: 250 frames -> 1 segment(s) of 337 frames (+8 context each side), RAM available 56.0 GB, per frame 150 MB
+[UPSCALE] segment 1/1: frames 0-249 (loaded 0-249) in 95.2s
+[UPSCALE] frozen-frame check: 0 suspicious frames (of 250; by frame%4: 0/0/0/0; first: -)
+[UPSCALE] model seedvr2_3b_fp16, input 848x480 -> output 1280x720, frames 250, time 110.4s, vram peak 18.2 GB
+[UPSCALE] RAM peak 31.5 GB (limit 62.0 GB), segment 337 frames, 1 segment(s)
+[JOB] upscale_only done: res 848x480 -> 1280x720, gen n/a, upscale 112.0s, total 113.5s, ...
+[JOB] fast480 done: res 848x480 -> 1280x720, gen 140.2s, upscale 180.3s, total 330.1s, ..., vram peak sampler ... / upscale 18.2 GB
+```
+(Numbers are examples.)
+
+What to check and send me:
+- **Frozen-frame line** (go/no-go for ComfyUI issue #16591). Many suspicious frames concentrated in `frame%4` bucket 0
+  means the issue reproduces: send me the line. Then watch those frames (the line lists the first ten indices).
+- **Mouth, teeth, eyes** in the 720p result vs the 480p input; any flicker; colour vs the input.
+- **Segment seams**: a 10 s clip is usually one segment. To see a seam, add `"upscale_segment_frames": 97` to u1 and look
+  at frames around 97 and 194.
+- **Times**: upscale time vs generation time; total vs your direct 720p jobs.
+- **RAM peak** and **vram peak** lines: they calibrate `UPSCALE_RAM_PER_FRAME_MB` (segment size) and show the headroom.
+
+### Optional inputs (tests only)
+
+| Input | Default | Meaning |
+|---|---|---|
+| `"upscale": "none"` | `"720p"` | fast480 without upscale (the v24/v25 output) |
+| `"upscale_model"` | `"3b"` | `"7b"` |
+| `"upscale_segment_frames"` | from RAM | force the segment size (rounded to 4n+1) |
+| `"upscale_chunk_frames"` | auto | force SeedVR2's temporal chunk (4n+1) for the first try |
+| `"upscale_color_correction"` | `"lab"` | `"wavelet"`, `"adain"`, `"none"` |
+
+### New env (optional)
+
+| Env | Default | Meaning |
+|---|---|---|
+| `UPSCALE_RAM_PER_FRAME_MB` | 150 | RAM per 1280x720 frame used to size the segments (calibrated from the RAM peak line) |
+| `UPSCALE_MODELS_AT_STARTUP` | 1 | 0 = prepare the upscale models on the first upscale job instead of at startup |

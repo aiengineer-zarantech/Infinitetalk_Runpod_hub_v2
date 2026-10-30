@@ -132,7 +132,7 @@ FINAL_FULL_GPU = ("[OFFLOAD] final: blocks_to_swap 0, force_offload False, node 
 @pytest.mark.parametrize("aspect, size", [(None, (848, 480)), ("16:9", (848, 480)), ("9:16", (480, 848))])
 @pytest.mark.parametrize("guard", ["on", "off"])
 def test_fast480_queues_full_gpu(posted, monkeypatch, caplog, aspect, size, guard):
-    extra = {"mode": "fast480", **CLIENT_38}
+    extra = {"mode": "fast480", "upscale": "none", **CLIENT_38}  # v26: upscale covered in test_upscale_job.py
     if aspect:
         extra["aspect"] = aspect
     caplog.set_level(logging.INFO)

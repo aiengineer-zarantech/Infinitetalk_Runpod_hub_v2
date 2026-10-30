@@ -31,6 +31,30 @@ LAZY_MODELS = {
     "Wan2_1-InfiniteTalk-Multi_fp8_e4m3fn_scaled_KJ.safetensors": "diffusion_models",
 }
 
+# v26: SeedVR2 upscale models (Apache-2.0, huggingface.co/Comfy-Org/SeedVR2 at a pinned revision).
+# Source on the volume: <root>/models/upscale/<file>; linked into ComfyUI under "folder".
+# "startup": copied at startup next to the models above; the others on the first job that needs them.
+# Missing on the volume: downloaded once (sha256 checked) and saved there. A failure never stops the worker:
+# only upscale jobs fail, with a clear error.
+UPSCALE_SOURCE_FOLDER = "upscale"
+UPSCALE_HF_REPO = "Comfy-Org/SeedVR2"
+UPSCALE_HF_REVISION = "df48879708206a403d2a61acd55578c2e80fd233"
+UPSCALE_MODELS = {
+    "seedvr2_3b_fp16.safetensors": {
+        "folder": "diffusion_models", "hf_path": "diffusion_models/seedvr2_3b_fp16.safetensors", "startup": True,
+        "size": 6784268336, "sha256": "98669fd2c06df5eca88baf68cd5c478775c8e61fc110e598c52b350145ea2660",
+    },
+    "seedvr2_ema_vae_fp16.safetensors": {
+        "folder": "vae", "hf_path": "vae/seedvr2_ema_vae_fp16.safetensors", "startup": True,
+        "size": 501324814, "sha256": "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1",
+    },
+    "seedvr2_7b_fp16.safetensors": {
+        "folder": "diffusion_models", "hf_path": "diffusion_models/seedvr2_7b_fp16.safetensors", "startup": False,
+        "size": 16480583960, "sha256": "2742ca6fee63bc5cc1773f426dd4b07b78cad27f51c9ea5cd42b035e6b592252",
+    },
+}
+DOWNLOAD_TIMEOUT_SEC = 60
+
 COPY_THREADS = int(os.environ.get("COPY_THREADS", "16"))
 COPY_PART_SIZE = int(os.environ.get("COPY_PART_MB", "64")) * 1024 * 1024
 
@@ -52,6 +76,7 @@ _abort_copies = threading.Event()
 _space_lock = threading.Lock()
 _space_claims = {}  # "<local_path>.tmp" -> bytes that copy needs in total
 _ensure_lock = threading.Lock()
+_download_lock = threading.Lock()
 _print_lock = threading.Lock()
 
 
@@ -236,19 +261,22 @@ def _copy_and_link(m):
     _log(f"   ✅ [LINKED] {model_name} ({size_mb:.1f} MB) -> {dest_path}")
 
 
-def ensure_model(model_name, subfolder=None):
+def ensure_model(model_name, subfolder=None, source_subfolder=None):
     """Copy one model to local disk and link it into ComfyUI if needed (used for LAZY_MODELS).
+    source_subfolder: folder on the volume when it differs from the ComfyUI folder (upscale models).
 
     Safe to call repeatedly: returns quickly when the link is already valid. Raises on failure.
     """
     if subfolder is None:
         subfolder = LAZY_MODELS.get(model_name) or MODEL_DESTINATIONS[model_name]
+    source_subfolder = source_subfolder or subfolder
     with _ensure_lock:
         start = time.time()
         dest_path, local_path = model_paths(model_name, subfolder)
-        src_found = find_source(model_name, subfolder)
+        src_found = find_source(model_name, source_subfolder)
         if src_found is None:
-            raise FileNotFoundError(f"{model_name} not found in any of {candidate_paths(model_name, subfolder)}")
+            raise FileNotFoundError(
+                f"{model_name} not found in any of {candidate_paths(model_name, source_subfolder)}")
         src_size = os.path.getsize(src_found)
         info = {
             "model": model_name,
@@ -273,6 +301,98 @@ def ensure_model(model_name, subfolder=None):
         return info
 
 
+def upscale_download_url(model_name):
+    return (f"https://huggingface.co/{UPSCALE_HF_REPO}/resolve/{UPSCALE_HF_REVISION}/"
+            f"{UPSCALE_MODELS[model_name]['hf_path']}")
+
+
+def download_upscale_model(model_name, urlopen=None):
+    """Downloads one upscale model to <volume>/models/upscale/<file> (via <file>.tmp, sha256 checked before
+    the rename). Returns the path. Raises on failure; a partial file never keeps the final name."""
+    import hashlib
+    import urllib.request
+
+    spec = UPSCALE_MODELS[model_name]
+    urlopen = urlopen or urllib.request.urlopen
+    with _download_lock:
+        existing = find_source(model_name, UPSCALE_SOURCE_FOLDER)
+        if existing is not None:
+            return existing
+        if not os.path.isdir(VOLUME_ROOT):
+            raise FileNotFoundError(f"{VOLUME_ROOT} is not mounted: nowhere to save {model_name} once")
+        target_dir = os.path.join(VOLUME_ROOT, "models", UPSCALE_SOURCE_FOLDER)
+        os.makedirs(target_dir, exist_ok=True)
+        target = os.path.join(target_dir, model_name)
+        tmp = f"{target}.tmp"
+        free = shutil.disk_usage(target_dir).free
+        if free < spec["size"]:
+            raise DiskSpaceError(f"[UPSCALE] not enough space on {target_dir} for {model_name}: needs "
+                                 f"{spec['size'] / 1024 ** 3:.2f} GB, {free / 1024 ** 3:.2f} GB free")
+        url = upscale_download_url(model_name)
+        _log(f"   ⬇️ [UPSCALE] downloading {model_name} ({spec['size'] / 1024 ** 3:.2f} GB) from "
+             f"{UPSCALE_HF_REPO}@{UPSCALE_HF_REVISION[:8]} to {target} (once)")
+        start = time.time()
+        digest = hashlib.sha256()
+        done = 0
+        next_log = 0.1
+        try:
+            with urlopen(url, timeout=DOWNLOAD_TIMEOUT_SEC) as response, open(tmp, "wb") as out:
+                while True:
+                    chunk = response.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    digest.update(chunk)
+                    done += len(chunk)
+                    if done >= next_log * spec["size"]:
+                        _log(f"   ⬇️ [UPSCALE] {model_name}: {100 * done / spec['size']:.0f}%")
+                        next_log += 0.1
+            if done != spec["size"]:
+                raise IOError(f"size {done} != expected {spec['size']}")
+            if digest.hexdigest() != spec["sha256"]:
+                raise IOError(f"sha256 {digest.hexdigest()} != expected {spec['sha256']}")
+            os.replace(tmp, target)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
+        elapsed = time.time() - start
+        _log(f"   ✅ [UPSCALE] downloaded {model_name} in {elapsed:.0f}s "
+             f"({done / 1024 ** 2 / max(elapsed, 1e-6):.1f} MB/s), sha256 OK -> {target}")
+        return target
+
+
+def ensure_upscale_model(model_name):
+    """Volume (download once if missing) -> local disk -> /ComfyUI/models/<folder>. Returns ensure_model's info."""
+    spec = UPSCALE_MODELS[model_name]
+    src = find_source(model_name, UPSCALE_SOURCE_FOLDER) or download_upscale_model(model_name)
+    if os.path.getsize(src) != spec["size"]:
+        raise IOError(f"{src} has {os.path.getsize(src)} bytes, expected {spec['size']} ({UPSCALE_HF_REPO})")
+    return ensure_model(model_name, spec["folder"], source_subfolder=UPSCALE_SOURCE_FOLDER)
+
+
+def prepare_startup_upscale_models():
+    """Startup part of the upscale models (run in a thread next to the main copies). Only logs on failure."""
+    if os.environ.get("UPSCALE_MODELS_AT_STARTUP", "1").strip().lower() in ("0", "false", "no", "off"):
+        _log("   💤 [UPSCALE] UPSCALE_MODELS_AT_STARTUP=0: upscale models prepared on the first upscale job")
+        return
+    for model_name, spec in UPSCALE_MODELS.items():
+        if not spec["startup"]:
+            src = find_source(model_name, UPSCALE_SOURCE_FOLDER)
+            where = f"found at {src}" if src else "not on the volume yet (downloaded on first use)"
+            _log(f"   💤 [LAZY] {model_name} ({spec['size'] / 1024 ** 2:.1f} MB) {where}; "
+                 f"copied on the first job that needs it")
+            continue
+        try:
+            info = ensure_upscale_model(model_name)
+            how = (f"copied {info['size_mb']:.1f} MB in {info.get('copy_seconds', 0):.1f}s"
+                   if info.get("copied") else "already local")
+            _log(f"   ✅ [UPSCALE] {model_name} ready ({how}) -> {info['dest_path']}")
+        except Exception as e:
+            _log(f"   ❌ [UPSCALE] {model_name} not prepared: {type(e).__name__}: {e}. Upscale jobs will retry "
+                 f"on first use; other jobs are not affected", err=True)
+
+
 def scan_and_link():
     print("=" * 60)
     print("🔍 [SETUP_MODELS] Starting model discovery and copying...")
@@ -288,6 +408,9 @@ def scan_and_link():
 
     # 1. Direct standard path checks and copying to local container disk
     print("\n🎯 Verifying / Copying required models:")
+    # v26 upscale models in parallel with the copies below; joined before the summary
+    upscale_thread = threading.Thread(target=prepare_startup_upscale_models, name="upscale-models", daemon=True)
+    upscale_thread.start()
     missing_models = []
     models_to_process = []
     lazy_found = []
@@ -426,6 +549,8 @@ def scan_and_link():
             else:
                 print(f"   ❌ [CRITICAL MISSING] {model_name} (expected in {dest_path})", file=sys.stderr)
                 sys.exit(1)
+
+    upscale_thread.join()
 
     # 3. Summary of ComfyUI model directories
     print("\n📊 Final ComfyUI models directory status:")

@@ -44,8 +44,10 @@ def worker_accel_env(monkeypatch, tmp_path):
     monkeypatch.setenv("WORKER_GPU_INFO", str(tmp_path / "no_worker_gpu.json"))
     for name in ("TORCH_COMPILE", "FP8_FAST", "OFFLOAD_TIERS", "OFFLOAD_480P_MAX_PIXELS", "OFFLOAD_CALIBRATION",
                  "OFFLOAD_TARGET_FRACTION", "RUNPOD_EXECUTION_TIMEOUT_SEC", "RUNPOD_RETURN_MARGIN_SEC",
-                 "OOM_RETRY_MIN_SEC", "ALLOC_MODE", "VRAM_STAGES"):
+                 "OOM_RETRY_MIN_SEC", "ALLOC_MODE", "VRAM_STAGES", "UPSCALE_RAM_PER_FRAME_MB"):
         monkeypatch.delenv(name, raising=False)
+    # v26: setup_models never downloads SeedVR2 in tests (tests that need it call it directly)
+    monkeypatch.setenv("UPSCALE_MODELS_AT_STARTUP", "0")
     monkeypatch.setattr(accel, "_compile_disabled_reason", None)
 
 
