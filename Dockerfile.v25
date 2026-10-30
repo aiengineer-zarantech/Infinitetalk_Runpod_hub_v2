@@ -1,0 +1,46 @@
+# ==============================================================================
+# Dockerfile.v25 - negative prompt + NAG on top of v24 (branch feature/fast480-upscale)
+# ==============================================================================
+# - New optional input "negative_prompt": sets node 241 negative_prompt and injects a WanVideoApplyNAG node
+#   (900) between 241 and the sampler. The sampler runs at cfg 1.0 (lightx2v distill), which skips the
+#   negative pass, so NAG is what applies it. Optional "nag_scale" / "nag_tau" / "nag_alpha" (11 / 2.5 / 0.25).
+# - '|' multi-prompts keep NAG off (split_cross_attn_ffn does not support it); the negative is still set.
+# - Jobs without negative_prompt queue exactly the same workflow as v23/v24 (tests/test_v23_prompt_identity.py).
+# Replaces /handler.py only (v24 + NAG block + one log line). Everything else is inherited from v24. Installs nothing.
+FROM digamberjhazaran/infinitetalk-runpod:v24
+
+SHELL ["/bin/bash", "-c"]
+
+# 1. Baseline freeze + fingerprints of the files this image must NOT change; v24 handler is the expected one
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
+    echo "d46f559f5e3e9368ae0ba4b595d1de18e98c1a868569156b9bfa295b39c24022  /handler.py" | sha256sum -c --quiet && \
+    sha256sum /setup_models.py /entrypoint.sh /I2V_single.json /I2V_multi.json /V2V_single.json /V2V_multi.json \
+        /I2V_single_compiled.json /I2V_multi_compiled.json > /tmp/unchanged.sha256 && \
+    find /worker_guard -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum >> /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes.sha256
+
+# 2. New handler; the wrapper in this image must provide the NAG node and the 241 negative-only output
+COPY handler.py /handler.py
+RUN sed -i 's/\r$//' /handler.py && \
+    grep -q "install_job_guard(handler, get_videos)" /handler.py && \
+    grep -q "final_offload_check(prompt)" /handler.py && \
+    grep -q "prepare_job_input(job_input)" /handler.py && \
+    grep -q '"class_type": "WanVideoApplyNAG"' /handler.py && \
+    /usr/bin/python3.10 -m py_compile /handler.py && rm -rf /__pycache__ && \
+    grep -q "^class WanVideoApplyNAG:" /ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper/nodes.py && \
+    grep -q 'RETURN_NAMES = ("text_embeds", "negative_text_embeds", "positive_prompt")' \
+        /ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper/nodes.py && \
+    echo "OK: handler + WanVideoApplyNAG present"
+
+# 3. LAST RUN STEP: unchanged files + unchanged custom nodes + zero package drift
+RUN sha256sum -c --quiet /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 \
+        | sort -z | xargs -0 sha256sum > /tmp/custom_nodes_post.sha256 && \
+    diff -u /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
+    /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "CRITICAL ERROR: files, custom nodes or the ComfyUI Python environment changed during the v25 build!"; \
+        exit 1; \
+    } && \
+    rm -f /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt /tmp/unchanged.sha256 /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
+    echo "OK: setup_models/entrypoint/worker_guard/all workflows/custom nodes unchanged. Zero package drift."

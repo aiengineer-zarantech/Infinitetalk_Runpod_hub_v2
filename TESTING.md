@@ -399,3 +399,35 @@ PROFILING.md section 5. If they differ, first check that two runs with the defau
 | `VRAM_STAGES` / `VRAM_STAGE_INTERVAL_MS` | 1 / 50 | Per-stage VRAM sampler inside ComfyUI; 0 turns it off |
 | `ALLOC_MODE` | unset | `native_expandable`, test only (A.6) |
 | `OOM_EMERGENCY_BLOCKS` | removed | Replaced by the ladder |
+
+## v25: negative prompt with NAG (head motion)
+
+New optional input `"negative_prompt"`. The sampler runs at cfg 1.0 (lightx2v distill LoRA), which skips the
+negative pass, so the worker injects `WanVideoApplyNAG` (node 900, fed by node 241's negative-only output) and
+points the sampler's `text_embeds` at it. Jobs without `negative_prompt` queue exactly the same workflow as
+v1.0-stable (`tests/test_v23_prompt_identity.py`); `tests/test_negative_prompt_nag.py` covers the new path.
+Optional: `"nag_scale"` (11.0), `"nag_tau"` (2.5), `"nag_alpha"` (0.25). A `|` multi-prompt keeps NAG off.
+
+### Endpoint
+
+- Image: `digamberjhazaran/infinitetalk-runpod:v25`, digest `sha256:cbb4e2e209562175033d972dd9a85b8e116caa4e1e3cc7e1ee6e3d4e70c850af`
+- Same test endpoint settings as Phase A.
+
+### A/B payloads
+
+Same image, audio, prompt and seed (workflow seed 2). B is A plus the Studio default negative prompt:
+
+```powershell
+$a = Get-Content payloads\phaseA\a2_normal_480p.json -Raw | ConvertFrom-Json
+$a | ConvertTo-Json -Depth 10 | Set-Content payloads\nag_a_off.json -Encoding utf8
+$a.input | Add-Member negative_prompt "bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards, excessive head movement, head shaking, nodding, swaying, turning head, tilting head, camera shake"
+$a | ConvertTo-Json -Depth 10 | Set-Content payloads\nag_b_on.json -Encoding utf8
+```
+
+### What to check
+
+- Logs of B: `[NAG] on: scale=11.0, tau=2.5, alpha=0.25` and `네거티브 프롬프트(241) 설정: ...`. A has no `[NAG]` line.
+- A runs as before (same frames as v24 for the same payload).
+- B vs A: less head shaking, nodding and swaying; lip sync and face identity unchanged; note the generation time
+  difference (NAG adds one extra cross-attention per block, no extra sampler pass).
+- If B looks stiff or over-corrected, try `"nag_scale": 7`; if motion is still too strong, try 15.

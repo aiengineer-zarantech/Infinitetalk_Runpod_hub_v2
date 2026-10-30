@@ -146,6 +146,9 @@ def queue_prompt(prompt, input_type="image", person_count="single"):
     logger.info(
         f"텍스트 노드(241) 설정: {prompt.get('241', {}).get('inputs', {}).get('positive_prompt', 'NOT_FOUND')}"
     )
+    logger.info(
+        f"네거티브 프롬프트(241) 설정: {prompt.get('241', {}).get('inputs', {}).get('negative_prompt', 'NOT_FOUND')}"
+    )
     if person_count == "multi":
         if "307" in prompt:
             logger.info(
@@ -599,6 +602,33 @@ def handler(job):
     # 공통 설정
     prompt["125"]["inputs"]["audio"] = wav_node_name
     prompt["241"]["inputs"]["positive_prompt"] = prompt_text
+
+    # 네거티브 프롬프트 + NAG: cfg 1.0에서는 샘플러가 negative 패스를 건너뛰므로
+    # WanVideoApplyNAG로 적용. negative_prompt가 없으면 워크플로우는 기존과 동일.
+    negative_prompt = job_input.get("negative_prompt")
+    if negative_prompt:
+        prompt["241"]["inputs"]["negative_prompt"] = negative_prompt
+        if "|" in prompt_text:
+            # '|' 다중 프롬프트는 split_cross_attn_ffn 경로를 타며 NAG 미지원
+            logger.warning("⚠️ [NAG] off: '|' 다중 프롬프트는 NAG를 지원하지 않습니다.")
+        elif sampler_node_id:
+            nag_inputs = {
+                "original_text_embeds": ["241", 0],
+                "nag_text_embeds": ["241", 1],  # negative 전용 임베딩 (NAG용 출력)
+                "nag_scale": float(job_input.get("nag_scale", 11.0)),
+                "nag_tau": float(job_input.get("nag_tau", 2.5)),
+                "nag_alpha": float(job_input.get("nag_alpha", 0.25)),
+            }
+            prompt["900"] = {
+                "inputs": nag_inputs,
+                "class_type": "WanVideoApplyNAG",
+                "_meta": {"title": "WanVideo Apply NAG"},
+            }
+            prompt[sampler_node_id]["inputs"]["text_embeds"] = ["900", 0]
+            logger.info(
+                f"[NAG] on: scale={nag_inputs['nag_scale']}, tau={nag_inputs['nag_tau']}, alpha={nag_inputs['nag_alpha']}"
+            )
+
     prompt["245"]["inputs"]["value"] = width
     prompt["246"]["inputs"]["value"] = height
 
