@@ -175,6 +175,21 @@ def probe(path):
                  any(s.get("codec_type") == "audio" for s in streams))
 
 
+def media_info(path):
+    """v28 "video_info": exact frames (decoded), fps, video duration (frames / fps), size and audio duration."""
+    video = probe(path)
+    out = _run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=duration",
+                "-of", "json", path])
+    streams = json.loads(out).get("streams", [])
+    try:
+        audio = round(float(streams[0]["duration"]), 6) if streams else None
+    except (KeyError, ValueError):
+        audio = None
+    return {"frames": video.frames, "fps": video.fps, "fps_value": video.fps_value,
+            "duration": round(video.frames / video.fps_value, 6), "width": video.width, "height": video.height,
+            "audio_duration": audio}
+
+
 def count_packets(path):
     """Frames in a lossless segment file without decoding it (ffv1: one packet per frame)."""
     out = _run(["ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0", "-show_entries",

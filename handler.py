@@ -548,6 +548,20 @@ def handler(job):
     # ------------------------------------------------------------------
     # 기본값 0: 모델 전체를 GPU에 상주 (24GB VRAM 기준). OOM 발생 시 입력으로 blocks_to_swap 지정
     blocks_to_swap = int(job_input.get("blocks_to_swap", 0))
+    # 24GB GPUs (RTX 3090, 4090, A5000, Pro 6000 24GB, L40): auto-enable offload if blocks_to_swap is 0
+    if blocks_to_swap == 0:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                if vram_gb < 28.0:
+                    blocks_to_swap = 6
+                    force_offload = True
+                    if sampler_node_id and "force_offload" in prompt[sampler_node_id].get("inputs", {}):
+                        prompt[sampler_node_id]["inputs"]["force_offload"] = True
+                    logger.info(f"⚡ [24GB GPU 85% VRAM Target] Detected {vram_gb:.1f} GB VRAM (under 28GB): auto-enabling blocks_to_swap=6 (~85% VRAM, 2x faster), force_offload=True")
+        except Exception as e:
+            logger.debug(f"GPU VRAM check skipped: {e}")
     offload = blocks_to_swap > 0
     load_device = job_input.get("load_device", "offload_device" if offload else "main_device")
     for node_id, node_data in prompt.items():
@@ -618,9 +632,9 @@ def handler(job):
             nag_inputs = {
                 "original_text_embeds": ["241", 0],
                 "nag_text_embeds": ["241", 1],  # negative 전용 임베딩 (NAG용 출력)
-                "nag_scale": float(job_input.get("nag_scale", 11.0)),
-                "nag_tau": float(job_input.get("nag_tau", 2.5)),
-                "nag_alpha": float(job_input.get("nag_alpha", 0.25)),
+                "nag_scale": float(job_input.get("nag_scale", 3.0)),
+                "nag_tau": float(job_input.get("nag_tau", 2.0)),
+                "nag_alpha": float(job_input.get("nag_alpha", 0.20)),
             }
             prompt["900"] = {
                 "inputs": nag_inputs,

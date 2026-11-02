@@ -17,7 +17,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from worker_guard import accel, attention, comfy_api, modes, offload, sysmem, upscale
+from worker_guard import accel, attention, comfy_api, modes, motion, offload, stabilize, sysmem, upscale
 from worker_guard.node_timer import NodeTimer
 from worker_guard.speed import SpeedTracker
 
@@ -145,6 +145,9 @@ class JobContext:
         self.attention = None
         self.attention_mode = None
         self.attention_note = "n/a"
+        self.nag_note = "nag n/a"
+        self.stab_sec = None
+        self.stab_method = None
         self.cached_nodes = set()
         self.vram = None
         self.gen_sec = None
@@ -709,6 +712,16 @@ def _changed_nodes(old, new):
     return sorted(set(old) ^ set(new) | {nid for nid in set(old) & set(new) if old[nid] != new[nid]})
 
 
+def _nag_note(prompt):
+    """"nag on, scale X (tau T, alpha A)" from the WanVideoApplyNAG node the handler added, or "nag off"."""
+    nodes = [n for n in prompt.values() if isinstance(n, dict) and n.get("class_type") == "WanVideoApplyNAG"]
+    if not nodes:
+        return "nag off"
+    inputs = nodes[0].get("inputs") or {}
+    return (f"nag on, scale {inputs.get('nag_scale')} (tau {inputs.get('nag_tau')}, "
+            f"alpha {inputs.get('nag_alpha')})")
+
+
 def _accel_line(ctx):
     """[ACCEL] one line per video job: attention, compile, block swap, GPU and the versions gpu_check.py saved."""
     info = accel.gpu_info() or {}
@@ -716,7 +729,8 @@ def _accel_line(ctx):
     vram = f"{_gb(device['vram_total']):.1f} GB" if device.get("vram_total") else "n/a"
     blocks = ctx.offload.blocks_to_swap if ctx.offload else "n/a"
     cache = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or "container default (not kept)"
-    return (f"[ACCEL] attention {ctx.attention_note}, torch_compile {ctx.compile_note}, blocks_to_swap {blocks}, "
+    return (f"[ACCEL] attention {ctx.attention_note}, torch_compile {ctx.compile_note}, {ctx.nag_note}, "
+            f"blocks_to_swap {blocks}, "
             f"gpu {gpu_name(device)}, vram {vram}, torch {info.get('torch', 'n/a')}, cuda {info.get('cuda', 'n/a')}, "
             f"sageattention {info.get('sageattention', 'n/a')}, triton {info.get('triton', 'n/a')}, compile cache {cache}")
 
@@ -742,6 +756,8 @@ def _log_final_job_line(ctx, result):
         up += " (failed)"
     sampler, vae, _ = _stage_peaks(ctx.vram)
     blocks = ctx.offload.blocks_to_swap if ctx.offload else "n/a"
+    if ctx.stab_sec is not None:
+        up += f", stabilize {ctx.stab_sec:.1f}s ({ctx.stab_method})"
     logger.info(
         f"[JOB] {ctx.mode} {'done' if ok else 'failed'}: res {res}, gen {gen}, upscale {up}, "
         f"total {_now() - ctx.started:.1f}s, attention {ctx.attention or 'n/a'}, blocks_to_swap {blocks}, "
@@ -779,6 +795,8 @@ def _log_job_line(ctx, result):
         if ctx.compile_fallback:
             what += ", compile_fallback yes"
         what += f", fp8_fast {'on' if ctx.fp8_fast else 'off'}"
+        if ctx.nag_note.startswith("nag on"):  # jobs without NAG keep the old line
+            what += f", {ctx.nag_note}"
         avg = sp.avg_s_per_it() if sp else None
         sampling = sp.sampling_sec() if sp else None
         what += f", avg {avg:.2f} s/it" if avg is not None else ", avg n/a s/it"
@@ -862,38 +880,113 @@ def _run_upscale(ctx, source_path, settings, job_input, out_path):
         _free_vram(ctx)
 
 
-def _upscale_after_generation(ctx, result, settings, job_input):
-    """fast480: replaces the 480p video by the 720p one. On any upscale failure the 480p video is
-    returned with "upscale": "failed" (the generation is never re-run for it)."""
-    out = {k: v for k, v in result.items() if k != "_video_file"}
-    source = result.get("_video_file")
-    if not source or not os.path.isfile(source):
-        out.update(upscale="failed", upscale_error="the 480p file of the generation was not found")
-        logger.error(f"[UPSCALE] failed: {out['upscale_error']}; returning the 480p video")
-        return out
+def _base_negative(job_input):
+    """The workflow's own node 241 negative prompt (what the handler queues when the job sends none)."""
+    try:
+        name = accel.workflow_name(job_input.get("input_type", "image"), job_input.get("person_count", "single"))
+        return accel.load_workflow(name)[motion.PROMPT_NODE]["inputs"]["negative_prompt"]
+    except Exception as e:
+        logger.warning(f"[MOTION] workflow negative prompt not readable ({type(e).__name__}: {e})")
+        return None
+
+
+def _post_steps(job_input):
+    return job_input.get("stabilize") is True or job_input.get("video_info") is True
+
+
+def _stabilize_step(ctx, source, out):
+    """Returns the stabilized file, or None (out gets "stabilize": "failed")."""
+    out_path = os.path.join(upscale.OUTPUT_DIR, f"stabilized_{os.path.splitext(os.path.basename(source))[0]}.mp4")
+    try:
+        ctx.stab_method, ctx.stab_sec, _ = stabilize.run(source, out_path)
+        out["stabilize"] = ctx.stab_method
+        return out_path
+    except Exception as e:
+        _remove_quietly(out_path)
+        error = str(e) if isinstance(e, stabilize.StabilizeError) else f"{type(e).__name__}: {e}"
+        logger.error(f"[STAB] failed: {error}; returning the unstabilized video")
+        out.update(stabilize="failed", stabilize_error=error[:1000])
+        return None
+
+
+def _upscale_step(ctx, source, settings, job_input, out):
+    """Returns the 720p file, or None (out gets "upscale": "failed"; the 480p video is returned)."""
     out_path = os.path.join(upscale.OUTPUT_DIR, f"upscaled_{os.path.splitext(os.path.basename(source))[0]}.mp4")
     up, error = _run_upscale(ctx, source, settings, job_input, out_path)
     if error:
         logger.error(f"[UPSCALE] failed: {error}; returning the 480p video")
         out.update(upscale="failed", upscale_error=error[:1000])
+        return None
+    return up.path
+
+
+def _deliver_into(out, path):
+    """Replaces the returned video (base64, or the copy on the network volume) by the file at path."""
+    if "video_path" in out:
+        import shutil
+        shutil.copy2(path, out["video_path"])
+    else:
+        import base64
+        with open(path, "rb") as f:
+            out["video"] = base64.b64encode(f.read()).decode("utf-8")
+
+
+def _post_process(ctx, result, upscale_settings, job_input):
+    """After the generation, on its file: stabilize (v28), the fast480 upscale (v26), then video_info (v28).
+    A failed step keeps the previous video and is reported in the result; the generation is never re-run."""
+    out = {k: v for k, v in result.items() if k != "_video_file"}
+    if not (upscale_settings or _post_steps(job_input)):
         return out
+    source = result.get("_video_file")
+    if not source or not os.path.isfile(source):
+        error = "the file of the generation was not found"
+        if job_input.get("stabilize") is True:
+            out.update(stabilize="failed", stabilize_error=error)
+        if upscale_settings:
+            logger.error(f"[UPSCALE] failed: {error}; returning the 480p video")
+            out.update(upscale="failed", upscale_error=error)
+        if job_input.get("video_info") is True:
+            out["video_info_error"] = error
+        return out
+    current, temps = source, []
     try:
-        if "video_path" in out:
-            import shutil
-            shutil.copy2(up.path, out["video_path"])
-        else:
-            import base64
-            with open(up.path, "rb") as f:
-                out["video"] = base64.b64encode(f.read()).decode("utf-8")
-    except Exception as e:
-        logger.error(f"[UPSCALE] could not return the 720p video ({type(e).__name__}: {e}); returning the 480p video")
-        ctx.upscale_out = None
-        out.update(upscale="failed", upscale_error=f"{type(e).__name__}: {e}")
+        if job_input.get("stabilize") is True:
+            stabilized = _stabilize_step(ctx, current, out)
+            if stabilized:
+                current = stabilized
+                temps.append(stabilized)
+        if upscale_settings:
+            upscaled = _upscale_step(ctx, current, upscale_settings, job_input, out)
+            if upscaled:
+                current = upscaled
+                temps.append(upscaled)
+        if current != source:
+            try:
+                _deliver_into(out, current)
+            except Exception as e:
+                error = f"{type(e).__name__}: {e}"
+                logger.error(f"[POST] could not return the processed video ({error}); returning the generated video")
+                if upscale_settings and "upscale" not in out:
+                    ctx.upscale_out = None
+                    out.update(upscale="failed", upscale_error=error)
+                if out.get("stabilize") not in (None, "failed"):
+                    out.update(stabilize="failed", stabilize_error=error)
+                current = source
+        if upscale_settings and "upscale" not in out:
+            out["upscale"] = "720p"
+        if job_input.get("video_info") is True:
+            try:
+                info = upscale.media_info(current)
+                out.update(info)
+                logger.info(f"[OUTPUT] frames {info['frames']}, fps {info['fps']}, duration {info['duration']:.3f}s, "
+                            f"{info['width']}x{info['height']}, audio {info['audio_duration']}s")
+            except Exception as e:
+                out["video_info_error"] = f"{type(e).__name__}: {e}"[:500]
+                logger.error(f"[OUTPUT] video_info failed: {out['video_info_error']}")
         return out
     finally:
-        _remove_quietly(up.path)
-    out["upscale"] = "720p"
-    return out
+        for path in temps:
+            _remove_quietly(path)
 
 
 def _upscale_only(ctx, job_input):
@@ -1000,13 +1093,20 @@ def install(handler, get_videos):
                 logger.error(mode_error)
                 result = {"error": mode_error}
                 return result
+            mode_error = motion.check(job_input)
+            if mode_error:
+                logger.error(mode_error)
+                result = {"error": mode_error}
+                return result
             ctx.mode = modes.job_mode(job_input)
             # v26: "upscale_only" runs no generation; fast480 jobs are upscaled after it ("upscale": "720p")
             if ctx.mode == modes.UPSCALE_ONLY:
                 result = _upscale_only(ctx, job_input)
                 return result
             upscale_settings = modes.upscale_settings(job_input)
-            if upscale_settings:
+            # v28: calm_motion / motion prompts (job input unchanged without them)
+            job_input = motion.apply(job_input, _base_negative(job_input))
+            if upscale_settings or _post_steps(job_input):
                 job_input = {**job_input, "_return_video_file": True}
             job = {**job, "input": job_input}
             _jobs_on_worker += 1
@@ -1046,7 +1146,6 @@ def install(handler, get_videos):
             ctx.fp8_fast = accel.fp8_decision(job_input, ctx.benchmark)
             logger.info(f"[COMPILE] torch.compile {ctx.compile_note}; fp8_fast {'on' if ctx.fp8_fast else 'off'}")
             ctx.attention_mode, ctx.attention_note = attention.decide(job_input, ctx.benchmark, accel.gpu_info())
-            logger.info(_accel_line(ctx))
 
             if job_input.get("person_count") == "multi":
                 result = _ensure_multi_model(ctx)
@@ -1065,8 +1164,8 @@ def install(handler, get_videos):
             if decision.mode == "auto" and not ctx.trip_kind and offload.is_oom(result):
                 result = _oom_ladder(ctx, decision, job, job_input, result, run)
             if isinstance(result, dict) and "_video_file" in result:
-                if upscale_settings and not ctx.trip_kind and not result.get("error"):
-                    result = _upscale_after_generation(ctx, result, upscale_settings, job_input)
+                if not ctx.trip_kind and not result.get("error"):
+                    result = _post_process(ctx, result, upscale_settings, job_input)
                 else:
                     result = {k: v for k, v in result.items() if k != "_video_file"}
             return result
@@ -1111,6 +1210,8 @@ def install(handler, get_videos):
                 logger.info(f"[COMPILE] using {accel.COMPILED_WORKFLOWS[name]}: added {additions[1]}")
         if ctx.fp8_fast:
             logger.warning(accel.apply_fp8_fast(prompt))
+        ctx.nag_note = _nag_note(prompt)
+        logger.info(_accel_line(ctx))
         _unload_if_model_changes(ctx, prompt)
         ctx.speed = SpeedTracker(accel.steps_per_window(prompt), accel.SAMPLER_NODE)
         ctx.nodes = NodeTimer() if accel.env_flag("PROFILE", False) else None

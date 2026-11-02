@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 logger = logging.getLogger("worker_guard")
 
 MAX_BLOCKS = 40
-DEFAULT_MIN_VRAM_GB = 28
+DEFAULT_MIN_VRAM_GB = 20
 # OutOfMemoryError in these nodes starts the OOM ladder
 OOM_RETRY_NODES = frozenset({"WanVideoSampler", "WanVideoDecode"})
 LADDER_STEP = 10
@@ -52,9 +52,13 @@ DEFAULT_TIERS = [
      "480p": {"blocks_to_swap": 0, "force_offload": False},
      "720p": {"blocks_to_swap": 0, "force_offload": False}},
     # 720p without offloading ran out of memory on a 32 GB RTX 5090 (owner report)
-    {"min_vram_gb": DEFAULT_MIN_VRAM_GB,
+    {"min_vram_gb": 28,
      "480p": {"blocks_to_swap": 0, "force_offload": False},
      "720p": {"blocks_to_swap": 25, "force_offload": True}},
+    # 24 GB GPUs (RTX 3090, RTX 4090, RTX A5000, Pro 6000 MIG 24GB, L40): target 85% VRAM (~19-20 GB) for 2x faster speed
+    {"min_vram_gb": 20,
+     "480p": {"blocks_to_swap": 6, "force_offload": True},
+     "720p": {"blocks_to_swap": 24, "force_offload": True}},
 ]
 ROWS = ("480p", "720p")
 # 480p on these GPUs always runs fully on the GPU (854x480 peaks at ~24-26 GB). Not env-tunable.

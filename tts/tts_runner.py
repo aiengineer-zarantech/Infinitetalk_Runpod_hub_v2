@@ -176,34 +176,6 @@ def split_text_into_chunks(text: str, max_chars: int = 250) -> list[str]:
     return chunks
 
 
-def get_optimal_device() -> str:
-    """
-    Determines if CUDA is available AND if the device architecture is supported
-    by the installed PyTorch build (e.g. sm_89, sm_80 vs sm_120).
-    Falls back to 'cpu' if unsupported to avoid 'no kernel image' crashes.
-    """
-    import torch
-    if not torch.cuda.is_available():
-        return "cpu"
-    try:
-        major, minor = torch.cuda.get_device_capability()
-        arch_name = f"sm_{major}{minor}"
-        raw_arches = torch.cuda.get_arch_list() or (
-            torch._C._cuda_getArchFlags().split() if hasattr(torch._C, "_cuda_getArchFlags") else []
-        )
-        if raw_arches and not any(arch_name in a for a in raw_arches):
-            logger.warning(
-                f"GPU architecture '{arch_name}' (Compute {major}.{minor}) is not supported "
-                f"by this PyTorch build ({torch.__version__}, supported: {raw_arches}). "
-                f"Falling back to CPU inference."
-            )
-            return "cpu"
-    except Exception as e:
-        logger.warning(f"Could not verify CUDA device architecture: {e}")
-        return "cpu"
-    return "cuda"
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Chatterbox Multilingual TTS Runner")
     parser.add_argument("--text", type=str, required=True, help="Input text prompt to synthesize")
@@ -225,16 +197,6 @@ def main(argv=None):
     import torch
     import numpy as np
     import soundfile as sf
-
-    # Chatterbox uses perth.PerthImplicitWatermarker, which requires pkg_resources.
-    # Fallback to DummyWatermarker if PerthImplicitWatermarker is None so generation never crashes.
-    try:
-        import perth
-        if getattr(perth, "PerthImplicitWatermarker", None) is None:
-            perth.PerthImplicitWatermarker = getattr(perth, "DummyWatermarker", None)
-    except Exception:
-        pass
-
     from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
 
     # 2. Validate Language
@@ -245,79 +207,44 @@ def main(argv=None):
             f"Supported languages: {', '.join(sorted(SUPPORTED_LANGUAGES.keys()))}"
         )
 
-    # 3. Determine device capability BEFORE making any CUDA calls
-    device = get_optimal_device()
-    logger.info(f"Chatterbox target execution device: {device}")
+    # 3. Check GPU VRAM and release ComfyUI memory if required
+    free_comfyui_memory(timeout_sec=20, min_free_gb=args.min_vram_gb)
 
-    # 4. Check GPU VRAM and release ComfyUI memory only if running on GPU
-    if device == "cuda":
-        free_comfyui_memory(timeout_sec=20, min_free_gb=args.min_vram_gb)
-    else:
-        cpu_threads = max(1, min(os.cpu_count() or 4, 8))
-        torch.set_num_threads(cpu_threads)
-        logger.info(f"Configured CPU execution with {cpu_threads} PyTorch threads")
-
-    # 5. Set Seeds for Deterministic Generation
+    # 4. Set Seeds for Deterministic Generation
     torch.manual_seed(args.seed)
-    if device == "cuda" and torch.cuda.is_available():
+    if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
 
-    # 6. Preprocess Reference Audio
+    # 5. Preprocess Reference Audio
     temp_ref_path = str(model_dir_path / f"temp_ref_{os.getpid()}.wav")
     try:
         processed_ref_wav = preprocess_reference_audio(args.audio_prompt, temp_ref_path)
 
-        # 7. Split Text into Chunks (Hindi + English aware)
+        # 6. Split Text into Chunks (Hindi + English aware)
         chunks = split_text_into_chunks(args.text, max_chars=250)
         if not chunks:
             raise ValueError("Input text prompt is empty or contains only whitespace.")
 
         logger.info(f"Synthesizing {len(chunks)} chunk(s) for language '{lang}'...")
 
-        # 8. Load Chatterbox Multilingual Model locally (Offline). 0.1.7 signature: from_local(ckpt_dir, device)
-        try:
-            logger.info(f"Loading Chatterbox model on {device}...")
-            model = ChatterboxMultilingualTTS.from_local(ckpt_dir=args.model_dir, device=device)
-        except Exception as e:
-            if device != "cpu" and ("no kernel image is available" in str(e) or "CUDA error" in str(e) or "not compatible" in str(e)):
-                logger.warning(f"CUDA execution failed on {device}: {e}. Retrying with CPU fallback...")
-                device = "cpu"
-                torch.cuda.empty_cache()
-                model = ChatterboxMultilingualTTS.from_local(ckpt_dir=args.model_dir, device="cpu")
-            else:
-                raise
+        # 7. Load Chatterbox Multilingual Model locally (Offline). 0.1.7 signature: from_local(ckpt_dir, device)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = ChatterboxMultilingualTTS.from_local(ckpt_dir=args.model_dir, device=device)
 
         audio_segments = []
         silence_gap = np.zeros(int(0.15 * model.sr), dtype=np.float32)
 
         for i, chunk in enumerate(chunks):
             logger.info(f"Generating chunk {i + 1}/{len(chunks)}: '{chunk[:60]}...'")
-            try:
-                wav_tensor = model.generate(
-                    text=chunk,
-                    language_id=lang,
-                    audio_prompt_path=processed_ref_wav,
-                    exaggeration=args.exaggeration,
-                    cfg_weight=args.cfg_weight,
-                    temperature=args.temperature,
-                )
-            except RuntimeError as e:
-                if ("no kernel image is available" in str(e) or "CUDA error" in str(e)) and device != "cpu":
-                    logger.warning(f"CUDA error during generation: {e}. Switching to CPU...")
-                    device = "cpu"
-                    torch.cuda.empty_cache()
-                    model = ChatterboxMultilingualTTS.from_local(ckpt_dir=args.model_dir, device="cpu")
-                    wav_tensor = model.generate(
-                        text=chunk,
-                        language_id=lang,
-                        audio_prompt_path=processed_ref_wav,
-                        exaggeration=args.exaggeration,
-                        cfg_weight=args.cfg_weight,
-                        temperature=args.temperature,
-                    )
-                else:
-                    raise
+            wav_tensor = model.generate(
+                text=chunk,
+                language_id=lang,
+                audio_prompt_path=processed_ref_wav,
+                exaggeration=args.exaggeration,
+                cfg_weight=args.cfg_weight,
+                temperature=args.temperature,
+            )
             wav_np = wav_tensor.detach().cpu().numpy().squeeze()
             audio_segments.append(wav_np)
             if i < len(chunks) - 1:

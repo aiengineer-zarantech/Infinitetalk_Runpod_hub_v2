@@ -104,21 +104,11 @@ def handle_tts(job_input: dict) -> dict:
             capture_output=True,
             text=True,
             env=clean_env,
-            timeout=600
+            timeout=180
         )
 
         if proc.returncode != 0:
-            stderr_text = proc.stderr.strip()
-            # If stderr contains a python traceback, prioritize the traceback lines over general warnings
-            lines = [l for l in stderr_text.splitlines() if l.strip()]
-            tb_lines = []
-            capturing = False
-            for l in lines:
-                if "Traceback (most recent call last):" in l:
-                    capturing = True
-                if capturing:
-                    tb_lines.append(l)
-            err_msg = "\n".join(tb_lines) if tb_lines else (stderr_text or proc.stdout.strip() or f"Process exited with code {proc.returncode}")
+            err_msg = proc.stderr.strip() or proc.stdout.strip() or f"Process exited with code {proc.returncode}"
             logger.error(f"[{task_id}] TTS Runner execution failed: {err_msg}")
             return {"error": f"TTS generation failed: {err_msg}"}
 
@@ -150,8 +140,8 @@ def handle_tts(job_input: dict) -> dict:
         }
 
     except subprocess.TimeoutExpired:
-        logger.error(f"[{task_id}] TTS execution timed out after 600s")
-        return {"error": "TTS generation timed out after 600 seconds."}
+        logger.error(f"[{task_id}] TTS execution timed out after 180s")
+        return {"error": "TTS generation timed out after 180 seconds."}
     except Exception as e:
         logger.error(f"[{task_id}] Unexpected error in handle_tts: {e}", exc_info=True)
         return {"error": f"Internal TTS handler error: {str(e)}"}
