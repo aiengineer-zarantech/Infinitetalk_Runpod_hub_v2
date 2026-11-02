@@ -252,3 +252,52 @@ def test_compile_cache_env_already_set_wins(run, tmp_path):
     assert rc == 0, out
     assert handler_env(out, "TORCHINDUCTOR_CACHE_DIR") == custom
     assert handler_env(out, "TRITON_CACHE_DIR") == f"{posix(volume)}/cache/compile/triton"
+
+
+# ---------------------------------------------------------------- perf/5090-speedup
+def _manager(tmp_path):
+    manager = tmp_path / "ComfyUI" / "custom_nodes" / "ComfyUI-Manager"
+    manager.mkdir(parents=True)
+    (manager / "__init__.py").write_text("")
+    return manager
+
+
+def test_comfyui_manager_disabled_by_default(run, tmp_path):
+    manager = _manager(tmp_path)
+    rc, out, _ = run()
+    assert rc == 0, out
+    assert not manager.exists() and (manager.parent / "ComfyUI-Manager.disabled" / "__init__.py").is_file()
+    assert "[COMFY] ComfyUI-Manager disabled (COMFYUI_MANAGER=0): no startup network calls" in out
+    assert index(out, "[COMFY] ComfyUI-Manager disabled") < index(out, "=== Starting ComfyUI in the background ===")
+
+
+def test_comfyui_manager_restored_with_flag(run, tmp_path):
+    manager = _manager(tmp_path)
+    manager.rename(manager.parent / "ComfyUI-Manager.disabled")
+    rc, out, _ = run(COMFYUI_MANAGER="1")
+    assert rc == 0, out
+    assert manager.is_dir() and "[COMFY] ComfyUI-Manager enabled (COMFYUI_MANAGER=1)" in out
+
+
+def test_no_manager_folder_is_fine(run):
+    rc, out, _ = run()
+    assert rc == 0, out
+    assert "ComfyUI-Manager" not in out
+
+
+def test_compile_cache_never_inside_the_hf_cache(run, tmp_path):
+    hf = tmp_path / "runpod-volume" / "huggingface-cache"
+    hf.mkdir(parents=True)
+    rc, out, _ = run(COMPILE_CACHE_VOLUME=posix(hf))
+    assert rc == 0, out
+    assert "is inside the RunPod HF cache, compile caches stay in the container (not persistent)" in out
+    assert handler_env(out, "TORCHINDUCTOR_CACHE_DIR") == "<unset>"
+    assert not (hf / "cache").exists()
+
+
+def test_model_source_line(run, tmp_path):
+    vol = tmp_path / "vol"
+    vol.mkdir()
+    rc, out, _ = run(MODEL_SOURCE="HF_cache", HF_CACHE_REPO="org/models", VOLUME_ROOT_CHECK=posix(vol))
+    assert rc == 0, out
+    assert f"[MODELS] MODEL_SOURCE=hf_cache, HF_CACHE_REPO=org/models, {posix(vol)} mounted, writable" in out

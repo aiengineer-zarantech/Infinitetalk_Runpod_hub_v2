@@ -11,3 +11,12 @@ ul_infi2.py
 .git
 __pycache__
 payloads
+# Never ship secrets or local test output (an old image layer leaked a RunPod key from these files)
+.env
+*.env
+test_worker_diag.py
+test_mutations.py
+download_all_models.py
+logs/
+outputs/
+scratch/

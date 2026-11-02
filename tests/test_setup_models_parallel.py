@@ -86,6 +86,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(setup_models, "COMFY_MODELS_DIR", str(tmp_path / "ComfyUI" / "models"))
     monkeypatch.setattr(setup_models, "LOCAL_MODELS_DIR", str(tmp_path / "models_local"))
     monkeypatch.setattr(setup_models, "COPY_PART_SIZE", 1024)  # several ranges per file
+    monkeypatch.setattr(setup_models, "COPY_RETRY_BASE_SEC", 0.0)  # retries without waiting
     monkeypatch.setattr(setup_models, "_space_claims", {})
     setup_models._abort_copies.clear()
     yield types.SimpleNamespace(tmp=tmp_path, volume=volume, sizes=sizes)
@@ -206,6 +207,8 @@ def test_existing_local_multi_is_linked_at_startup(env, capsys):
 
 
 def test_copy_failure_exits_and_stops_other_copies(env, monkeypatch, capsys):
+    # One attempt per file: the fail-fast path that runs once every retry of a file is used up
+    monkeypatch.setattr(setup_models, "COPY_FILE_RETRIES", 1)
     monkeypatch.setattr(setup_models, "COPY_FILE_WORKERS", 4)
     largest = max(STARTUP_MODELS, key=lambda n: env.sizes[n])
     state = track_copies(monkeypatch, delay=0.2, fail_on=largest)

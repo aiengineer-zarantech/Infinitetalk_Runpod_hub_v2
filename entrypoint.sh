@@ -40,6 +40,9 @@ COMPILE_CACHE_VOLUME="${COMPILE_CACHE_VOLUME:-/runpod-volume}"
 COMPILE_CACHE_ROOT="$COMPILE_CACHE_VOLUME/cache/compile"
 if [ "${COMPILE_CACHE:-1}" = "0" ]; then
     echo "[COMPILE] cache: COMPILE_CACHE=0, compile caches stay in the container (lost when the worker stops)"
+elif case "$COMPILE_CACHE_VOLUME" in *huggingface-cache*) true ;; *) false ;; esac; then
+    # RunPod Cached Models: RunPod-managed, possibly read-only and shared between endpoints. Never write there.
+    echo "[COMPILE] cache: $COMPILE_CACHE_VOLUME is inside the RunPod HF cache, compile caches stay in the container (not persistent)"
 elif [ -d "$COMPILE_CACHE_VOLUME" ] && [ -w "$COMPILE_CACHE_VOLUME" ] \
         && mkdir -p "$COMPILE_CACHE_ROOT/inductor" "$COMPILE_CACHE_ROOT/triton" 2>/dev/null; then
     export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$COMPILE_CACHE_ROOT/inductor}"
@@ -49,6 +52,29 @@ elif [ -d "$COMPILE_CACHE_VOLUME" ] && [ -w "$COMPILE_CACHE_VOLUME" ] \
     echo "[COMPILE] cache: TORCHINDUCTOR_CACHE_DIR=$TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
 else
     echo "[COMPILE] cache: $COMPILE_CACHE_VOLUME not mounted or not writable, compile caches stay in the container"
+fi
+
+# perf/5090-speedup: where the models come from (setup_models.py does the work and logs [TIMING] model setup)
+MODEL_SOURCE_NOW=$(printf '%s' "${MODEL_SOURCE:-volume}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+VOLUME_CHECK="${VOLUME_ROOT_CHECK:-/runpod-volume}"
+VOLUME_STATE="not mounted"
+if [ -d "$VOLUME_CHECK" ]; then
+    VOLUME_STATE=$([ -w "$VOLUME_CHECK" ] && echo "mounted, writable" || echo "mounted, read-only")
+fi
+echo "[MODELS] MODEL_SOURCE=$MODEL_SOURCE_NOW, HF_CACHE_REPO=${HF_CACHE_REPO:-unset}, $VOLUME_CHECK $VOLUME_STATE"
+
+# perf/5090-speedup: ComfyUI-Manager makes network calls at startup (registry / update checks) and no workflow
+# node needs it. COMFYUI_MANAGER=0 (default) renames it to *.disabled, which ComfyUI skips (nodes.py:
+# load_custom_nodes); COMFYUI_MANAGER=1 restores it.
+MANAGER_DIR="$COMFY_DIR/custom_nodes/ComfyUI-Manager"
+if [ "${COMFYUI_MANAGER:-0}" = "1" ]; then
+    if [ -d "$MANAGER_DIR.disabled" ] && [ ! -e "$MANAGER_DIR" ]; then
+        mv "$MANAGER_DIR.disabled" "$MANAGER_DIR" && echo "[COMFY] ComfyUI-Manager enabled (COMFYUI_MANAGER=1)"
+    fi
+elif [ -d "$MANAGER_DIR" ]; then
+    rm -rf "$MANAGER_DIR.disabled"
+    mv "$MANAGER_DIR" "$MANAGER_DIR.disabled" \
+        && echo "[COMFY] ComfyUI-Manager disabled (COMFYUI_MANAGER=0): no startup network calls"
 fi
 
 echo "=== Model Setup & Discovery (background) ==="

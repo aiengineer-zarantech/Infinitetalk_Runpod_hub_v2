@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""Model setup at worker startup: every model the workflows need ends up linked under /ComfyUI/models.
+
+MODEL_SOURCE=volume (default): copy from the network volume (GeeseFS / S3) to local disk, then link.
+    Range reads are retried (COPY_RANGE_RETRIES, default 5) and a failed file is retried and RESUMED
+    (COPY_FILE_RETRIES, default 3; finished ranges are kept in <file>.tmp.progress), so one S3 hiccup no
+    longer kills the worker and restarts a ~29 GB copy from zero.
+MODEL_SOURCE=hf_cache: RunPod Cached Models. The files are linked straight from
+    HF_CACHE_ROOT/models--<org>--<name>/snapshots/<hash>/<folder>/<file> (HF_CACHE_REPO=<org>/<name>), no copy.
+    A file that is not in the cache uses the volume path (HF_CACHE_FALLBACK=1, default) or fails (0).
+"""
+import json
 import os
 import sys
 import shutil
@@ -59,6 +70,118 @@ COPY_THREADS = int(os.environ.get("COPY_THREADS", "16"))
 COPY_PART_SIZE = int(os.environ.get("COPY_PART_MB", "64")) * 1024 * 1024
 
 
+def _env_int(name, default, low, high):
+    try:
+        return min(high, max(low, int(os.environ.get(name, "").strip() or default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name, default, low, high):
+    try:
+        return min(high, max(low, float(os.environ.get(name, "").strip() or default)))
+    except ValueError:
+        return default
+
+
+# A failed / short read of one byte range is retried this many times (backoff, source reopened)
+COPY_RANGE_RETRIES = _env_int("COPY_RANGE_RETRIES", 5, 0, 20)
+# A failed file is copied again this many times in total, resuming from the ranges already done
+COPY_FILE_RETRIES = _env_int("COPY_FILE_RETRIES", 3, 1, 10)
+COPY_RETRY_BASE_SEC = _env_float("COPY_RETRY_BASE_SEC", 1.0, 0.0, 30.0)   # 1, 2, 4, 8, 16 s
+COPY_RETRY_MAX_SEC = 16.0
+
+# RunPod Cached Models (MODEL_SOURCE=hf_cache)
+HF_CACHE_DEFAULT_ROOT = "/runpod-volume/huggingface-cache/hub"
+# Sizes of the public sources (huggingface.co, checked 2026-11-02). A cached file of another size is only
+# logged as a warning: a re-export with the same name may legitimately differ.
+EXPECTED_SIZES = {
+    "Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors": 16993877896,
+    "Wan2_1-InfiniteTalk-Single_fp8_e4m3fn_scaled_KJ.safetensors": 2713548210,
+    "MelBandRoformer_fp16.safetensors": 456479072,
+    "wav2vec2-chinese-base_fp16.safetensors": 190115368,
+    "umt5-xxl-enc-fp8_e4m3fn.safetensors": 6731333792,
+    "clip_vision_h.safetensors": 1264219396,
+    "Wan2_1_VAE_bf16.safetensors": 253806278,
+    "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors": 738005744,
+}
+
+
+class HFCacheError(Exception):
+    pass
+
+
+def model_source():
+    """MODEL_SOURCE: "volume" (default) or "hf_cache". Unknown values mean "volume"."""
+    raw = os.environ.get("MODEL_SOURCE", "").strip().lower()
+    return raw if raw in ("volume", "hf_cache") else "volume"
+
+
+def hf_cache_fallback():
+    return os.environ.get("HF_CACHE_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def hf_snapshot_dir():
+    """The snapshot folder of HF_CACHE_REPO: HF_CACHE_REVISION, else refs/main, else the only snapshot.
+    Raises HFCacheError with a message that says what is missing."""
+    repo = os.environ.get("HF_CACHE_REPO", "").strip()
+    if repo.count("/") != 1 or repo.startswith("/") or repo.endswith("/"):
+        raise HFCacheError(f"HF_CACHE_REPO must be <org>/<name> (got {repo!r})")
+    root = os.environ.get("HF_CACHE_ROOT", "").strip() or HF_CACHE_DEFAULT_ROOT
+    base = os.path.join(root, "models--" + repo.replace("/", "--"))
+    snapshots = os.path.join(base, "snapshots")
+    if not os.path.isdir(snapshots):
+        raise HFCacheError(f"{snapshots} not found (is {repo} set as the endpoint's cached model?)")
+    revision = os.environ.get("HF_CACHE_REVISION", "").strip()
+    if revision:
+        path = os.path.join(snapshots, revision)
+        if not os.path.isdir(path):
+            raise HFCacheError(f"HF_CACHE_REVISION {revision} not found in {snapshots}")
+        return path
+    ref = os.path.join(base, "refs", "main")
+    try:
+        with open(ref, encoding="utf-8") as f:
+            path = os.path.join(snapshots, f.read().strip())
+        if os.path.isdir(path):
+            return path
+    except OSError:
+        pass
+    found = sorted(d for d in os.listdir(snapshots) if os.path.isdir(os.path.join(snapshots, d)))
+    if len(found) == 1:
+        return os.path.join(snapshots, found[0])
+    raise HFCacheError(f"{len(found)} snapshots in {snapshots} and no usable refs/main "
+                       f"(set HF_CACHE_REVISION): {found}")
+
+
+def hf_cache_file(snapshot, model_name, subfolder):
+    """<snapshot>/<folder>/<file>, then <snapshot>/<file>; None when the cache does not have it."""
+    for path in (os.path.join(snapshot, subfolder, model_name), os.path.join(snapshot, model_name)):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def upscale_at_startup():
+    """UPSCALE_MODELS_AT_STARTUP; when unset: on with MODEL_SOURCE=volume, off with hf_cache."""
+    raw = os.environ.get("UPSCALE_MODELS_AT_STARTUP")
+    if raw is None or raw.strip() == "":
+        return model_source() != "hf_cache"
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+_stats_lock = threading.Lock()
+_stats = {"range_retries": 0, "file_retries": 0, "resumed_bytes": 0}
+
+
+def _count(key, n=1):
+    with _stats_lock:
+        _stats[key] += n
+
+
+def _backoff(attempt):
+    return min(COPY_RETRY_BASE_SEC * (2 ** (attempt - 1)), COPY_RETRY_MAX_SEC)
+
+
 def _clamp_file_workers(value):
     """Number of files copied at the same time, always 4..8."""
     try:
@@ -93,55 +216,124 @@ def _log(msg, err=False):
         print(msg, file=sys.stderr if err else sys.stdout, flush=True)
 
 
-def _copy_range(src_fd, dst_fd, offset, length):
-    """Copy one byte range with pread/pwrite (each range = separate S3 request on GeeseFS)."""
+def _copy_range(src_fd, dst_fd, offset, length, src_path=None):
+    """Copy one byte range with pread/pwrite (each range = separate S3 request on GeeseFS).
+    A failed or empty read is retried COPY_RANGE_RETRIES times with backoff; with src_path the source is
+    reopened for the retry (a fresh GeeseFS handle). Writes go to local disk and are not retried."""
     with _inflight_ranges:
         buffer_size = 8 * 1024 * 1024
         end = offset + length
-        while offset < end:
-            if _abort_copies.is_set():
-                raise IOError("Copy aborted because another copy failed")
-            to_read = min(buffer_size, end - offset)
-            chunk = os.pread(src_fd, to_read, offset)
-            if not chunk:
-                raise IOError(f"Unexpected EOF at offset {offset}")
-            written = 0
-            while written < len(chunk):
-                w = os.pwrite(dst_fd, chunk[written:], offset + written)
-                if w <= 0:
-                    raise IOError(f"Failed to write at offset {offset + written}")
-                written += w
-            offset += len(chunk)
+        fd, own_fd, failures = src_fd, None, 0
+        try:
+            while offset < end:
+                if _abort_copies.is_set():
+                    raise IOError("Copy aborted because another copy failed")
+                to_read = min(buffer_size, end - offset)
+                try:
+                    chunk = os.pread(fd, to_read, offset)
+                    if not chunk:
+                        raise IOError(f"Unexpected EOF at offset {offset}")
+                except OSError as e:
+                    failures += 1
+                    if failures > COPY_RANGE_RETRIES:
+                        raise IOError(f"read at offset {offset} failed {failures} time(s): {e}") from e
+                    wait = _backoff(failures)
+                    _count("range_retries")
+                    _log(f"   🔁 [RETRY] read at offset {offset} failed ({type(e).__name__}: {e}); "
+                         f"retry {failures}/{COPY_RANGE_RETRIES} in {wait:.0f}s", err=True)
+                    if _abort_copies.wait(wait):
+                        raise IOError("Copy aborted because another copy failed")
+                    if src_path:
+                        if own_fd is not None:
+                            os.close(own_fd)
+                        own_fd = os.open(src_path, os.O_RDONLY)
+                        fd = own_fd
+                    continue
+                written = 0
+                while written < len(chunk):
+                    w = os.pwrite(dst_fd, chunk[written:], offset + written)
+                    if w <= 0:
+                        raise IOError(f"Failed to write at offset {offset + written}")
+                    written += w
+                offset += len(chunk)
+        finally:
+            if own_fd is not None:
+                os.close(own_fd)
     return length
 
 
+def _progress_header(src, total_bytes):
+    return {"size": total_bytes, "part": COPY_PART_SIZE, "mtime": int(os.stat(src).st_mtime)}
+
+
+def _load_progress(progress_path, tmp_dst, header):
+    """Range indexes already copied into tmp_dst by an earlier attempt, or None when it cannot be resumed."""
+    try:
+        with open(progress_path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        if not lines or json.loads(lines[0]) != header or os.path.getsize(tmp_dst) != header["size"]:
+            return None
+        return {int(x) for x in lines[1:] if x.strip().isdigit()}
+    except (OSError, ValueError):
+        return None
+
+
 def copy_file_chunked(src, dst):
-    """Copy file in parallel byte ranges (COPY_THREADS x COPY_PART_MB), timing and calculating speed in MB/s."""
+    """Copy file in parallel byte ranges (COPY_THREADS x COPY_PART_MB), timing and calculating speed in MB/s.
+    Resumable: every finished range is recorded in <dst>.tmp.progress, so the next attempt (a retry, or a
+    restarted process on the same disk) copies only the missing ranges of the same source file."""
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     tmp_dst = f"{dst}.tmp"
-    if os.path.exists(tmp_dst):
-        os.remove(tmp_dst)
+    progress_path = f"{tmp_dst}.progress"
 
     start_time = time.time()
     total_bytes = os.path.getsize(src)
+    header = _progress_header(src, total_bytes)
+    done = _load_progress(progress_path, tmp_dst, header)
+    resuming = done is not None
+    if not resuming:
+        for stale in (tmp_dst, progress_path):
+            if os.path.exists(stale):
+                os.remove(stale)
+        done = set()
+        with open(progress_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(header) + "\n")
     ranges = [
-        (off, min(COPY_PART_SIZE, total_bytes - off))
-        for off in range(0, total_bytes, COPY_PART_SIZE)
+        (i, off, min(COPY_PART_SIZE, total_bytes - off))
+        for i, off in enumerate(range(0, total_bytes, COPY_PART_SIZE))
     ]
+    todo = [r for r in ranges if r[0] not in done]
+    if resuming:
+        skipped = sum(ln for i, _, ln in ranges if i in done)
+        _count("resumed_bytes", skipped)
+        _log(f"   ⏩ [RESUME] {os.path.basename(dst)}: {skipped / 1024 ** 2:.1f} MB already copied, "
+             f"{len(todo)}/{len(ranges)} range(s) left")
+    progress_lock = threading.Lock()
     src_fd = os.open(src, os.O_RDONLY)
-    dst_fd = os.open(tmp_dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    dst_fd = os.open(tmp_dst, os.O_WRONLY | os.O_CREAT | (0 if resuming else os.O_TRUNC), 0o644)
     try:
-        os.ftruncate(dst_fd, total_bytes)
-        with ThreadPoolExecutor(max_workers=max(1, min(COPY_THREADS, len(ranges)))) as pool:
-            futures = [pool.submit(_copy_range, src_fd, dst_fd, off, ln) for off, ln in ranges]
+        if not resuming:
+            os.ftruncate(dst_fd, total_bytes)
+        with open(progress_path, "a", encoding="utf-8") as progress, \
+                ThreadPoolExecutor(max_workers=max(1, min(COPY_THREADS, len(todo) or 1))) as pool:
+            futures = {pool.submit(_copy_range, src_fd, dst_fd, off, ln, src): i for i, off, ln in todo}
             for fut in as_completed(futures):
                 fut.result()
+                with progress_lock:
+                    progress.write(f"{futures[fut]}\n")
+                    progress.flush()
     finally:
         os.close(src_fd)
         os.close(dst_fd)
     if os.path.getsize(tmp_dst) != total_bytes:
-        raise IOError(f"Size mismatch after copy: {os.path.getsize(tmp_dst)} != {total_bytes}")
+        for stale in (tmp_dst, progress_path):  # unknown content: the next attempt starts fresh
+            if os.path.exists(stale):
+                os.remove(stale)
+        raise IOError(f"Size mismatch after copy: {os.path.getsize(tmp_dst) if os.path.exists(tmp_dst) else 0}"
+                      f" != {total_bytes}")
     os.replace(tmp_dst, dst)
+    if os.path.exists(progress_path):
+        os.remove(progress_path)
     elapsed = time.time() - start_time
     mb = total_bytes / (1024 * 1024)
     speed = (mb / elapsed) if elapsed > 0 else 0.0
@@ -195,6 +387,15 @@ def link_is_valid(dest_path, local_path, size):
         return False
 
 
+def cache_link_is_valid(dest_path, target):
+    """True if the ComfyUI path is a symlink that resolves to the cached file (any size: see EXPECTED_SIZES)."""
+    try:
+        return (os.path.islink(dest_path) and os.path.realpath(dest_path) == os.path.realpath(target)
+                and os.path.isfile(dest_path))
+    except OSError:
+        return False
+
+
 def _link(local_path, dest_path):
     if os.path.islink(dest_path) or os.path.exists(dest_path):
         os.remove(dest_path)
@@ -230,6 +431,24 @@ def _release_space(local_path):
         _space_claims.pop(f"{local_path}.tmp", None)
 
 
+def _copy_with_retries(model_name, src, dst):
+    """copy_file_chunked up to COPY_FILE_RETRIES times, each attempt resuming the previous one.
+    Raises CopyError after the last attempt, or at once when another file already failed for good."""
+    for attempt in range(1, COPY_FILE_RETRIES + 1):
+        try:
+            return copy_file_chunked(src, dst)
+        except Exception as e:
+            if _abort_copies.is_set() or attempt == COPY_FILE_RETRIES:
+                tries = f" after {attempt} attempt(s)" if attempt > 1 else ""
+                raise CopyError(f"   ❌ Failed to copy {model_name}{tries}: {e}") from e
+            wait = _backoff(attempt)
+            _count("file_retries")
+            _log(f"   🔁 [RETRY] {model_name}: attempt {attempt}/{COPY_FILE_RETRIES} failed ({e}); resuming in "
+                 f"{wait:.0f}s", err=True)
+            if _abort_copies.wait(wait):
+                raise CopyError(f"   ❌ Failed to copy {model_name}: {e}") from e
+
+
 def _copy_and_link(m):
     """Copy (if needed) and link one model. Runs in a worker thread; raises on failure."""
     model_name = m["model_name"]
@@ -245,10 +464,7 @@ def _copy_and_link(m):
         _claim_space(model_name, local_path, src_size)
         try:
             _log(f"   📋 [COPYING] {model_name} ({size_mb:.1f} MB) from {src_found} to {local_path}...")
-            try:
-                mb, elapsed, speed = copy_file_chunked(src_found, local_path)
-            except Exception as e:
-                raise CopyError(f"   ❌ Failed to copy {model_name}: {e}") from e
+            mb, elapsed, speed = _copy_with_retries(model_name, src_found, local_path)
             _log(f"   ✅ [COPIED] {model_name} ({mb:.1f} MB in {elapsed:.2f}s, {speed:.1f} MB/s) -> {local_path}")
         finally:
             _release_space(local_path)
@@ -273,6 +489,18 @@ def ensure_model(model_name, subfolder=None, source_subfolder=None):
     with _ensure_lock:
         start = time.time()
         dest_path, local_path = model_paths(model_name, subfolder)
+        if model_source() == "hf_cache":
+            try:
+                cached = hf_cache_file(hf_snapshot_dir(), model_name, subfolder)
+            except HFCacheError as e:
+                cached = None
+                _log(f"   ⚠️ [HF_CACHE] {model_name}: {e}; using the volume", err=True)
+            if cached:
+                if not cache_link_is_valid(dest_path, cached):
+                    _link(cached, dest_path)
+                return {"model": model_name, "source": cached, "local_path": cached, "dest_path": dest_path,
+                        "size_mb": os.path.getsize(cached) / (1024 * 1024), "copied": False, "hf_cache": True,
+                        "seconds": time.time() - start}
         src_found = find_source(model_name, source_subfolder)
         if src_found is None:
             raise FileNotFoundError(
@@ -290,7 +518,7 @@ def ensure_model(model_name, subfolder=None, source_subfolder=None):
             if not local_copy_ok(local_path, src_size):
                 _claim_space(model_name, local_path, src_size)
                 try:
-                    _, elapsed, speed = copy_file_chunked(src_found, local_path)
+                    _, elapsed, speed = _copy_with_retries(model_name, src_found, local_path)
                 finally:
                     _release_space(local_path)
                 info.update(copied=True, copy_seconds=elapsed, speed_mb_s=speed)
@@ -373,7 +601,7 @@ def ensure_upscale_model(model_name):
 
 def prepare_startup_upscale_models():
     """Startup part of the upscale models (run in a thread next to the main copies). Only logs on failure."""
-    if os.environ.get("UPSCALE_MODELS_AT_STARTUP", "1").strip().lower() in ("0", "false", "no", "off"):
+    if not upscale_at_startup():
         _log("   💤 [UPSCALE] UPSCALE_MODELS_AT_STARTUP=0: upscale models prepared on the first upscale job")
         return
     for model_name, spec in UPSCALE_MODELS.items():
@@ -406,11 +634,39 @@ def scan_and_link():
     except Exception as me:
         print(f"Error checking mounts: {me}")
 
+    setup_start = time.time()
+    source = model_source()
+    cached = {}   # model_name -> file in the HF cache snapshot
+    if source == "hf_cache":
+        print(f"\n🗄️ [HF_CACHE] MODEL_SOURCE=hf_cache, repo {os.environ.get('HF_CACHE_REPO', '').strip() or '(unset)'}")
+        try:
+            snapshot = hf_snapshot_dir()
+            print(f"   snapshot: {snapshot}")
+            for model_name, subfolder in MODEL_DESTINATIONS.items():
+                path = hf_cache_file(snapshot, model_name, subfolder)
+                if path:
+                    cached[model_name] = path
+        except HFCacheError as e:
+            if not hf_cache_fallback():
+                print(f"❌ [HF_CACHE] {e} (HF_CACHE_FALLBACK=0)", file=sys.stderr)
+                sys.exit(1)
+            print(f"   ⚠️ [HF_CACHE] {e}; every model uses the volume (HF_CACHE_FALLBACK=1)", file=sys.stderr)
+        for model_name, path in cached.items():
+            dest_path, _ = model_paths(model_name, MODEL_DESTINATIONS[model_name])
+            _link(path, dest_path)
+            size = os.path.getsize(dest_path)
+            expected = EXPECTED_SIZES.get(model_name)
+            note = "" if expected in (None, size) else f" ⚠️ size {size} != expected {expected}"
+            print(f"   ✅ [HF_CACHE] {model_name} ({size / 1024 ** 2:.1f} MB) -> {dest_path}{note}")
+        not_cached = [m for m in MODEL_DESTINATIONS if m not in cached and m not in LAZY_MODELS]
+        if not_cached and not hf_cache_fallback():
+            print(f"❌ [HF_CACHE] not in the cache: {not_cached} (HF_CACHE_FALLBACK=0)", file=sys.stderr)
+            sys.exit(1)
+        for model_name in not_cached:
+            print(f"   ⚠️ [MODELS] {model_name}: not in HF cache, volume fallback")
+
     # 1. Direct standard path checks and copying to local container disk
     print("\n🎯 Verifying / Copying required models:")
-    # v26 upscale models in parallel with the copies below; joined before the summary
-    upscale_thread = threading.Thread(target=prepare_startup_upscale_models, name="upscale-models", daemon=True)
-    upscale_thread.start()
     missing_models = []
     models_to_process = []
     lazy_found = []
@@ -418,10 +674,15 @@ def scan_and_link():
     lazy_bytes_needed = 0
 
     for model_name, subfolder in MODEL_DESTINATIONS.items():
+        if model_name in cached:
+            continue
         dest_path, local_path = model_paths(model_name, subfolder)
 
         # Candidate paths in volume/workspace
         src_found = find_source(model_name, subfolder)
+        if src_found is None and source == "hf_cache" and model_name in LAZY_MODELS:
+            print(f"   ⚠️ [LAZY] {model_name} is neither in the HF cache nor on a volume: jobs that need it fail")
+            continue
 
         if src_found:
             src_size = os.path.getsize(src_found)
@@ -477,6 +738,21 @@ def scan_and_link():
             f"{lazy_bytes_needed / (1024 ** 3):.2f} GB more; the first multi job will fail with a disk space error.",
             file=sys.stderr,
         )
+
+    # v26 upscale models in parallel with the copies below; joined before the summary. Their bytes now count in
+    # the disk check: before, a startup upscale copy could take the space a required model needed (exit 1).
+    upscale_thread = None
+    upscale_bytes = 0
+    if upscale_at_startup():
+        for name, spec in UPSCALE_MODELS.items():
+            if spec["startup"] and not local_copy_ok(model_paths(name, spec["folder"])[1], spec["size"]):
+                upscale_bytes += spec["size"]
+    if upscale_bytes and free_bytes < total_bytes_needed + upscale_bytes:
+        print(f"   ⚠️ [UPSCALE] startup copy skipped: {upscale_bytes / 1024 ** 3:.2f} GB does not fit next to the "
+              f"required models; upscale models are prepared on the first upscale job", file=sys.stderr)
+    else:
+        upscale_thread = threading.Thread(target=prepare_startup_upscale_models, name="upscale-models", daemon=True)
+        upscale_thread.start()
 
     # Perform the copies in parallel (largest first) and point ComfyUI models to local copies
     ordered = sorted(models_to_process, key=lambda m: m["src_size"] if m["needs_copy"] else 0, reverse=True)
@@ -550,7 +826,20 @@ def scan_and_link():
                 print(f"   ❌ [CRITICAL MISSING] {model_name} (expected in {dest_path})", file=sys.stderr)
                 sys.exit(1)
 
-    upscale_thread.join()
+    if upscale_thread is not None:
+        upscale_thread.join()
+
+    for model_name, path in cached.items():
+        dest_path = os.path.join(COMFY_MODELS_DIR, MODEL_DESTINATIONS[model_name], model_name)
+        if not cache_link_is_valid(dest_path, path):
+            print(f"   ❌ [VERIFY FAILED] {dest_path} does not resolve to the cached {path}", file=sys.stderr)
+            sys.exit(1)
+    with _stats_lock:
+        stats = dict(_stats)
+    print(f"[TIMING] model setup {time.time() - setup_start:.1f}s (source {source}, {len(cached)} linked from the "
+          f"HF cache, {total_bytes_needed / 1024 ** 3:.2f} GB copied from the volume, "
+          f"{stats['resumed_bytes'] / 1024 ** 3:.2f} GB resumed, range retries {stats['range_retries']}, "
+          f"file retries {stats['file_retries']})")
 
     # 3. Summary of ComfyUI model directories
     print("\n📊 Final ComfyUI models directory status:")
