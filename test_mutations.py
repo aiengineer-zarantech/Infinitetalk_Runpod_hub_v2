@@ -2,7 +2,8 @@ import requests
 import os
 import sys
 
-API_KEY = os.environ["RUNPOD_API_KEY"]
+# Secrets only from the environment, never in this file: export RUNPOD_API_KEY=... before running
+API_KEY = os.environ.get("RUNPOD_API_KEY", "").strip() or sys.exit("Set RUNPOD_API_KEY in the environment")
 
 query = """
 query {

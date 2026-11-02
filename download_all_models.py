@@ -7,8 +7,9 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-ENDPOINT_ID = "ghuoueuyp8iu7g"
-API_KEY = os.environ["RUNPOD_API_KEY"]
+ENDPOINT_ID = os.environ.get("ENDPOINT_ID", "ghuoueuyp8iu7g").strip()
+# Secrets only from the environment, never in this file: export RUNPOD_API_KEY=... before running
+API_KEY = os.environ.get("RUNPOD_API_KEY", "").strip() or sys.exit("Set RUNPOD_API_KEY in the environment")
 
 headers = {
     "Authorization": f"Bearer {API_KEY}",
