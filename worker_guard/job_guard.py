@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass
 
 from worker_guard import accel, attention, comfy_api, modes, motion, offload, stabilize, sysmem, upscale
+from worker_guard import model_lock
 from worker_guard.node_timer import NodeTimer
 from worker_guard.speed import SpeedTracker
 
@@ -177,6 +178,10 @@ class JobContext:
         self.upscale_sec = None
         self.upscale_vram = None
         self.upscale_out = None
+        self.locked = False           # MODEL_LOCK: locked config for this job
+        self.model_status = None      # "cold" | "reused" (decided before queueing)
+        self.lock_sig = None
+        self.lock_report = None
         self.lock = threading.Lock()
 
     def note_vram(self, used_bytes):
@@ -810,6 +815,122 @@ def _log_job_line(ctx, result):
         logger.error(f"[JOB] failed in {elapsed:.1f}s ({what}): {str(error)[:300]}")
 
 
+def _locked_before_queue(ctx, prompt):
+    """MODEL_LOCK: locked node inputs, resident-model check and VRAM pre-flight. Raises (after a watchdog trip,
+    so the handler returns a clear error) when the job must not run on this worker."""
+    fixes = model_lock.enforce(prompt)
+    if fixes:
+        logger.error(f"[MODEL_LOCK] workflow did not match the locked config, corrected: {', '.join(fixes)}")
+    ctx.lock_sig = loader_signature(prompt)
+    status, message = model_lock.STATE.check(ctx.lock_sig)
+    if status == "mismatch":
+        ctx.trip("model_lock", message, refresh=True)
+        logger.error(message)
+        raise RuntimeError(message)
+    ctx.model_status = status
+    tag = model_lock.config_hash()
+    if status == "reused":
+        logger.info(f"[MODEL] MODEL REUSED (config {tag}; loads {model_lock.STATE.loads}, reuses so far "
+                    f"{model_lock.STATE.reuses}): no loading, straight to generation")
+    else:
+        logger.info(f"[MODEL] MODEL LOADED (cold start) (config {tag}): loading once for this worker")
+
+    def read_device():
+        return comfy_api.first_device(comfy_api.system_stats(timeout=10))
+
+    def clear():
+        try:
+            out = comfy_api.clear_cache()
+        except Exception as e:
+            logger.warning(f"[MODEL_LOCK] clear_cache failed: {type(e).__name__}: {e}")
+            return False
+        if out is None:
+            logger.warning("[MODEL_LOCK] zz_worker_mem node not installed: cannot clear non-model memory")
+            return False
+        return True
+
+    try:
+        device = read_device()
+    except Exception as e:
+        device = None
+        logger.warning(f"[MODEL_LOCK] VRAM pre-flight skipped: {type(e).__name__}: {e}")
+    if device:
+        report = model_lock.preflight(prompt, device, model_lock.STATE.idle_bytes if status == "reused" else 0,
+                                      clear, read_device)
+        ctx.lock_report = report
+        logger.info(f"[MODEL_LOCK] pre-flight: {report['frames']} frames, VRAM used {report['vram_used_start_gb']} / "
+                    f"{report['total_gb']} GB, non-model {report['non_model_gb']} GB, projected peak "
+                    f"{report['projected_peak_gb']} GB, headroom {report['headroom_gb']} GB"
+                    f"{', cleared non-model memory' if report['cleared'] else ''}"
+                    f"{', tiled final VAE decode' if report['tiled'] else ''}")
+        if not report["ok"]:
+            ctx.trip("vram", report["message"], refresh=True)
+            logger.error(report["message"])
+            raise RuntimeError(report["message"])
+
+
+def _locked_failure(ctx, result):
+    """MODEL_LOCK: no compile fallback, no blocks_to_swap escalation, no retry with other settings here."""
+    out = dict(result)
+    if offload.is_oom(result):
+        model_lock.STATE.forget()     # ComfyUI unloads every model after an OOM
+        out["error"] = ("[MODEL_LOCK] out of memory at the locked settings (blocks_to_swap "
+                        f"{model_lock.config()['blocks_to_swap']}); not retried with other settings. Refreshing "
+                        f"this worker so the job can run on another one | {result.get('error')}")
+        out["refresh_worker"] = True
+    else:
+        out["error"] = ("[MODEL_LOCK] torch.compile failed at the locked settings; no fallback to the uncompiled "
+                        "workflow (that would reload the model). Set torch_compile false in "
+                        f"locked_model_config.json and TORCH_COMPILE=0 if this repeats | {result.get('error')}")
+    logger.error(out["error"][:500])
+    return out
+
+
+def _locked_after(ctx, result):
+    """MODEL_LOCK: resident state, verification against ComfyUI's cache, and the per-job model line."""
+    ok = isinstance(result, dict) and not result.get("error")
+    oom = isinstance(result, dict) and offload.is_oom(result)
+    loader_cached = model_lock.LOADER in ctx.cached_nodes
+    status = ctx.model_status
+    if status == "reused" and not loader_cached and ctx.cached_nodes is not None and ok:
+        logger.error("[MODEL] expected MODEL REUSED but ComfyUI ran the model loader again (it reloaded the model)")
+        status = "reloaded"
+    elif status == "cold" and loader_cached:
+        status = "reused"
+    idle = 0
+    if ok:
+        try:
+            device = comfy_api.first_device(comfy_api.system_stats(timeout=10))
+            idle = device["vram_used"] if device else 0
+        except Exception:
+            idle = 0
+    if ctx.lock_sig is not None:
+        model_lock.STATE.after_job(ctx.lock_sig, ok, oom, idle, ctx.model_status)
+    _, _, top = _stage_peaks(ctx.vram)
+    peak = max(top or 0, ctx.peak_vram or 0)
+    total = (ctx.device or {}).get("vram_total") or 0
+    report = ctx.lock_report or {}
+    info = {
+        "status": {"cold": "loaded", "reused": "reused"}.get(status, status or "unknown"),
+        "config": model_lock.config_hash(),
+        "vram_start_gb": round(_gb(ctx.used_at_start or 0), 2),
+        "peak_gb": round(_gb(peak), 2) if peak else None,
+        "headroom_gb": round(_gb(total - peak), 2) if peak and total else None,
+        "blocks_to_swap": ctx.offload.blocks_to_swap if ctx.offload else None,
+        "tiled_vae": bool(report.get("tiled")),
+        "frames": report.get("frames"),
+        "job_sec": round(_now() - ctx.started, 1),
+        "worker_loads": model_lock.STATE.loads,
+        "worker_reuses": model_lock.STATE.reuses,
+    }
+    label = {"loaded": "MODEL LOADED (cold start)", "reused": "MODEL REUSED"}.get(info["status"], info["status"])
+    logger.info(f"[MODEL] job {ctx.job_number}: {label}, VRAM start {info['vram_start_gb']} GB, peak "
+                f"{info['peak_gb']} GB, headroom {info['headroom_gb']} GB, blocks_to_swap {info['blocks_to_swap']}, "
+                f"tiled_vae {'yes' if info['tiled_vae'] else 'no'}, {info['frames']} frames, {info['job_sec']}s"
+                f"{'' if ok else ', FAILED'}")
+    return {**result, "model": info} if isinstance(result, dict) else result
+
+
 def _unload_if_model_changes(ctx, prompt):
     """When this prompt needs a different model than the one ComfyUI holds (another blocks_to_swap,
     attention mode, compile setting ...), unload the old one first so two copies never share the VRAM."""
@@ -1106,6 +1227,17 @@ def install(handler, get_videos):
                 result = run(job)
                 return result
 
+            if model_lock.enabled():
+                clean, ignored, lock_error = model_lock.sanitize(job_input)
+                if lock_error:
+                    logger.error(lock_error)
+                    result = {"error": lock_error}
+                    return result
+                if ignored:
+                    logger.warning(f"[MODEL_LOCK] ignored job fields (model settings are locked): {', '.join(ignored)}")
+                job_input, ctx.locked = clean, True
+                job = {**job, "input": job_input}
+
             # v24 modes (fast480) before the offload decision, so it sees the final size
             job_input, mode_error = modes.prepare_job_input(job_input)
             if mode_error:
@@ -1133,14 +1265,25 @@ def install(handler, get_videos):
             ctx.used_at_start = ctx.device["vram_used"]
             # with blocks swapped, all of them must fit in RAM (ladder steps up to 40 also logged)
 
-            decision, reject = offload.decide(job_input, ctx.device["vram_total"], gpu_name(ctx.device),
-                                              ctx.device["vram_used"], _resident_used)
+            if ctx.locked:
+                cfg = model_lock.config()
+                decision, reject = offload.Decision(
+                    mode="locked", blocks_to_swap=cfg["blocks_to_swap"], force_offload=cfg["force_offload"],
+                    vram_gb=ctx.device["vram_total"] / (1024 ** 3),
+                    width=int(job_input.get("width", cfg["max_width"])),
+                    height=int(job_input.get("height", cfg["max_height"]))), None
+            else:
+                decision, reject = offload.decide(job_input, ctx.device["vram_total"], gpu_name(ctx.device),
+                                                  ctx.device["vram_used"], _resident_used)
             if reject:
                 logger.error(reject)
                 result = {"error": reject, "refresh_worker": True}
                 return result
             ctx.offload = decision
-            if decision.mode == "auto":
+            if decision.mode == "locked":
+                logger.info(f"[OFFLOAD] locked: blocks_to_swap {decision.blocks_to_swap}, force_offload "
+                            f"{decision.force_offload} (config {model_lock.config_hash()})")
+            elif decision.mode == "auto":
                 logger.info(
                     f"[OFFLOAD] auto: VRAM {decision.vram_gb:.1f} GB, {decision.width}x{decision.height} -> "
                     f"blocks_to_swap {decision.blocks_to_swap}, force_offload {decision.force_offload}"
@@ -1161,10 +1304,26 @@ def install(handler, get_videos):
                     logger.error(result["error"])
                     return result
                 logger.info(f"[BENCHMARK] audio trimmed to the first {accel.BENCHMARK_SECONDS}s")
-            ctx.compile_on, ctx.compile_note = accel.compile_decision(job_input, ctx.benchmark)
-            ctx.fp8_fast = accel.fp8_decision(job_input, ctx.benchmark)
+            if ctx.locked:
+                cfg = model_lock.config()
+                ctx.compile_on, ctx.compile_note = accel.compile_decision({"torch_compile": cfg["torch_compile"]}, True)
+                ctx.fp8_fast = bool(cfg["fp8_fast"])
+                ctx.attention_mode, ctx.attention_note = attention.decide(
+                    {"attention_mode": cfg["attention_mode"]}, True, accel.gpu_info())
+                problem = None
+                if bool(ctx.compile_on) != bool(cfg["torch_compile"]):
+                    problem = f"torch_compile is locked {cfg['torch_compile']} but this worker has it {ctx.compile_note}"
+                elif ctx.attention_mode != cfg["attention_mode"]:
+                    problem = f"attention is locked {cfg['attention_mode']} but this worker can only use {ctx.attention_note}"
+                if problem:
+                    result = {"error": f"[MODEL_LOCK] {problem}; refreshing this worker", "refresh_worker": True}
+                    logger.error(result["error"])
+                    return result
+            else:
+                ctx.compile_on, ctx.compile_note = accel.compile_decision(job_input, ctx.benchmark)
+                ctx.fp8_fast = accel.fp8_decision(job_input, ctx.benchmark)
+                ctx.attention_mode, ctx.attention_note = attention.decide(job_input, ctx.benchmark, accel.gpu_info())
             logger.info(f"[COMPILE] torch.compile {ctx.compile_note}; fp8_fast {'on' if ctx.fp8_fast else 'off'}")
-            ctx.attention_mode, ctx.attention_note = attention.decide(job_input, ctx.benchmark, accel.gpu_info())
 
             if job_input.get("person_count") == "multi":
                 result = _ensure_multi_model(ctx)
@@ -1172,7 +1331,9 @@ def install(handler, get_videos):
                     return result
 
             result = run({**job, "input": offload.apply(job_input, decision)})
-            if ctx.compile_on and not ctx.trip_kind and accel.is_compile_error(result):
+            if ctx.locked and not ctx.trip_kind and (accel.is_compile_error(result) or offload.is_oom(result)):
+                result = _locked_failure(ctx, result)
+            elif ctx.compile_on and not ctx.trip_kind and accel.is_compile_error(result):
                 details = result.get("details", {})
                 reason = f"{details.get('exception_type')}: {str(details.get('exception_message') or '').strip()[:300]}"
                 logger.error(f"[COMPILE] failed: {reason}; re-running once with the original workflow")
@@ -1189,6 +1350,8 @@ def install(handler, get_videos):
                     result = {k: v for k, v in result.items() if k != "_video_file"}
             if ctx.benchmark and isinstance(result, dict) and not result.get("error"):
                 result = {**result, "timing": job_timing(ctx)}
+            if ctx.locked:
+                result = _locked_after(ctx, result)
             return result
         finally:
             _current = None
@@ -1233,7 +1396,10 @@ def install(handler, get_videos):
             logger.warning(accel.apply_fp8_fast(prompt))
         ctx.nag_note = _nag_note(prompt)
         logger.info(_accel_line(ctx))
-        _unload_if_model_changes(ctx, prompt)
+        if ctx.locked:
+            _locked_before_queue(ctx, prompt)
+        else:
+            _unload_if_model_changes(ctx, prompt)
         ctx.speed = SpeedTracker(accel.steps_per_window(prompt), accel.SAMPLER_NODE)
         ctx.nodes = NodeTimer()   # v34: always on ([TIMING] stages line; timing dict on benchmark jobs)
         ctx.cached_nodes = set()
