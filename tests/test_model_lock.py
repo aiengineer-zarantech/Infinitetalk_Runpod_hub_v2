@@ -85,10 +85,16 @@ def test_preflight_ok_without_any_action():
     assert p["130"]["inputs"]["enable_vae_tiling"] is False
 
 
-def test_preflight_two_minute_job_gets_tiled_decode():
-    p = prompt_with_frames(3081)                 # 2 min
-    rep = model_lock.preflight(p, dev(20.0), int(20.0 * GB), lambda: False, None)
-    assert rep["ok"] and rep["tiled"] and p["130"]["inputs"]["enable_vae_tiling"] is True
+def test_preflight_refuses_jobs_longer_than_the_measured_maximum():
+    p = prompt_with_frames(3081)                 # 2 min: OOM in the sampler on the pod (2026-11-03)
+    rep = model_lock.preflight(p, dev(20.0), int(20.0 * GB), lambda: pytest.fail("no clear"), None)
+    assert not rep["ok"] and rep["too_long"] and "longer than the locked maximum 1615" in rep["message"]
+
+
+def test_preflight_one_minute_job_still_runs():
+    p = prompt_with_frames(1581)                 # 60 s chunk
+    rep = model_lock.preflight(p, dev(19.1), int(19.1 * GB), lambda: False, None)
+    assert rep["ok"] and not rep.get("too_long")
 
 
 def test_preflight_clears_non_model_memory_first():
@@ -99,7 +105,7 @@ def test_preflight_clears_non_model_memory_first():
 
 
 def test_preflight_fails_fast_when_nothing_helps():
-    p = prompt_with_frames(3081)
+    p = prompt_with_frames(1615)
     rep = model_lock.preflight(p, dev(30.0), int(20.0 * GB), lambda: True, lambda: dev(30.0))
     assert not rep["ok"] and "Failing fast" in rep["message"]
 
@@ -186,13 +192,13 @@ def model_lines(caplog):
 def test_five_jobs_load_once_then_reuse(worker, caplog):
     caplog.set_level(logging.INFO, logger="worker_guard")
     results = []
-    for i, frames in enumerate([831, 3081, 831, 3081, 831]):     # 30 s and 2 min audio
+    for i, frames in enumerate([831, 1581, 831, 1581, 831]):     # 30 s and 60 s (the longest allowed) audio
         worker["frames"] = frames
         worker["cached"] = [] if i == 0 else ["122", "120", "134", "138", "177"]
         results.append(worker["run"](job()))
     assert [r["model"]["status"] for r in results] == ["loaded", "reused", "reused", "reused", "reused"]
     assert all(r["model"]["blocks_to_swap"] == 0 for r in results)
-    assert [r["model"]["tiled_vae"] for r in results] == [False, True, False, True, False]
+    assert all(r["model"]["headroom_gb"] >= 2.5 for r in results)
     sigs = {json.dumps(job_guard.loader_signature(p), sort_keys=True) for p in worker["queued"]}
     assert len(sigs) == 1                                          # identical loader chain on every job
     lines = model_lines(caplog)
@@ -250,7 +256,7 @@ def test_oom_is_not_retried_with_other_settings(worker):
 def test_not_enough_vram_fails_fast_before_queueing(worker):
     worker["run"](job())
     worker["used_gb"] = 30.5                                      # something else holds the VRAM
-    worker["frames"] = 3081
+    worker["frames"] = 1581
     worker["cached"] = ["122"]
     before = len(worker["queued"])
     r = worker["run"](job())
@@ -269,3 +275,13 @@ def test_model_lock_off_keeps_the_old_path(worker, monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger="worker_guard")
     r = worker["run"](job())
     assert "model" not in r and not model_lines(caplog)
+
+
+def test_too_long_job_is_refused_without_refreshing_the_worker(worker):
+    worker["run"](job())
+    worker["frames"] = 3081
+    worker["cached"] = ["122"]
+    before = len(worker["queued"])
+    r = worker["run"](job())
+    assert "longer than the locked maximum" in r["error"] and not r.get("refresh_worker")
+    assert len(worker["queued"]) == before and model_lock.STATE.signature is not None   # model still resident

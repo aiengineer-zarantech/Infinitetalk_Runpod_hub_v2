@@ -858,6 +858,10 @@ def _locked_before_queue(ctx, prompt):
         report = model_lock.preflight(prompt, device, model_lock.STATE.idle_bytes if status == "reused" else 0,
                                       clear, read_device)
         ctx.lock_report = report
+        if report.get("too_long"):
+            ctx.trip("model_lock", report["message"], refresh=False)   # the worker and its model are fine
+            logger.error(report["message"])
+            raise RuntimeError(report["message"])
         logger.info(f"[MODEL_LOCK] pre-flight: {report['frames']} frames, VRAM used {report['vram_used_start_gb']} / "
                     f"{report['total_gb']} GB, non-model {report['non_model_gb']} GB, projected peak "
                     f"{report['projected_peak_gb']} GB, headroom {report['headroom_gb']} GB"

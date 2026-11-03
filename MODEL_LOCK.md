@@ -37,6 +37,15 @@ Measured 2026-11-03 on pod b98p0yq88j1lel (RTX 5090, 31.4 GB, v32 code, 854x480,
 (3081 frames) projects 29.1 GB, below the 2.5 GB headroom, so the pre-flight turns on the tiled final decode.
 **Re-measure with the 2 min job of the test below** and update `vram` in the config.
 
+## Max frames (2026-11-03 pod test)
+
+Job 1 (30 s, 831 frames, cold): COMPLETED in 994 s, peak 25.0 GB, headroom 6.3 GB, blocks_to_swap 0.
+Job 2 (2 min, 3081 frames): `MODEL REUSED` (no reload), then OOM in the sampler before its first step (31.3 GB).
+The sampler cost grows with the frame count, so the tiled-decode estimate above was wrong for long jobs.
+`max_frames` = 1615 (61 s of audio, ran without an OOM) is now locked: longer jobs are refused before queueing
+(no OOM, no worker refresh, the model stays loaded). The backend (deploy/pod) splits longer audio into <= 60 s
+chunks that run one after another on the same pod.
+
 ## Separate diagnostics
 
 Benchmark / A-B fields are ignored on a locked worker, so diagnostics cannot change a production model. Run them
