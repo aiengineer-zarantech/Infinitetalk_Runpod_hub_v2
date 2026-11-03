@@ -88,7 +88,16 @@ cd "$COMFY_DIR" || { echo "❌ $COMFY_DIR not found"; kill "$COPY_PID" 2>/dev/nu
 # expandable_segments only works with torch's native allocator; ComfyUI appends backend:cudaMallocAsync
 # to PYTORCH_CUDA_ALLOC_CONF unless it is started with --disable-cuda-malloc.
 COMFY_ALLOC_ARGS=()
-if [ "${ALLOC_MODE:-}" = "native_expandable" ]; then
+# MODEL_LOCK (default on): expandable segments against fragmentation, so the resident model and the per-job
+# tensors fit without an OOM (an OOM makes ComfyUI unload every model). ALLOC_MODE=cuda_malloc keeps ComfyUI's
+# default cudaMallocAsync allocator.
+if [ -z "${ALLOC_MODE:-}" ] && [ "${MODEL_LOCK:-1}" != "0" ]; then
+    ALLOC_MODE=native_expandable
+    echo "[MODEL_LOCK] ALLOC_MODE unset: using native_expandable"
+fi
+if [ "${ALLOC_MODE:-}" = "cuda_malloc" ]; then
+    echo "ALLOC_MODE=cuda_malloc: ComfyUI default allocator (cudaMallocAsync)"
+elif [ "${ALLOC_MODE:-}" = "native_expandable" ]; then
     export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
     COMFY_ALLOC_ARGS=(--disable-cuda-malloc)
     echo "ALLOC_MODE=native_expandable: PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF, ComfyUI --disable-cuda-malloc (test only)"

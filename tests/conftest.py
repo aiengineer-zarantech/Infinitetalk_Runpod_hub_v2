@@ -50,6 +50,9 @@ def worker_accel_env(monkeypatch, tmp_path):
         monkeypatch.delenv(name, raising=False)
     # v26: setup_models never downloads SeedVR2 in tests (tests that need it call it directly)
     monkeypatch.setenv("UPSCALE_MODELS_AT_STARTUP", "0")
+    # MODEL_LOCK is on by default in production; the existing tests cover the unlocked behaviour
+    # (tests/test_model_lock.py turns it on)
+    monkeypatch.setenv("MODEL_LOCK", "0")
     monkeypatch.setattr(accel, "_compile_disabled_reason", None)
 
 

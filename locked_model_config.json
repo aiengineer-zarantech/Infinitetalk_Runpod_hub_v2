@@ -1,0 +1,28 @@
+{
+  "_doc": "LOCKED_MODEL_CONFIG (worker_guard/model_lock.py). With MODEL_LOCK=1 every job uses exactly these model settings, so ComfyUI keeps the loaded model and never reloads it. Jobs may only change image, audio, prompt, negative prompt and frame count. Edit only together with a new measurement.",
+  "workflow": "I2V_single.json",
+  "torch_compile": true,
+  "base_precision": "bf16",
+  "quantization": "fp8_e4m3fn",
+  "fp8_fast": false,
+  "lora": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
+  "lora_strength": 1.0,
+  "merge_loras": false,
+  "attention_mode": "sageattn",
+  "blocks_to_swap": 0,
+  "force_offload": false,
+  "load_device": "main_device",
+  "offload_img_emb": false,
+  "offload_txt_emb": false,
+  "max_width": 854,
+  "max_height": 480,
+  "vram": {
+    "headroom_gb": 2.5,
+    "sampler_peak_gb": 22.4,
+    "decode_gb_per_frame": 0.00217,
+    "tiled_decode_gb": 1.5,
+    "cold_idle_gb": 1.0,
+    "garbage_clear_above_gb": 1.0,
+    "measured": "2026-11-03, pod b98p0yq88j1lel, RTX 5090 31.4 GB, v32, 854x480, blocks_to_swap 0, force_offload false, compile on: 1615 frames (22 windows), watchdog peak 22.4 GB during sampling, stage peak 25.9 GB (83%) = 5.5 GB headroom. blocks_to_swap 0 is the lowest value, so it is locked. decode_gb_per_frame = (25.9 - 22.4) / 1615, a one-point linear estimate of the final VAE decode: re-measure with a 2 min job."
+  }
+}
