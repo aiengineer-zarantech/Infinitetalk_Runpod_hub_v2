@@ -155,5 +155,17 @@ done
     || fail "ComfyUI device check failed"
 
 # Start the handler in the foreground with unbuffered output (-u)
+# deploy/pod: start_pod.sh sets POD_MODE=1. POD_API=pod (default) = authenticated job API (pod/pod_api.py);
+# POD_API=runpod_sim = the RunPod SDK dev simulator (no auth, runs the job inside POST /status: debug only).
+if [ "${POD_MODE:-0}" = "1" ]; then
+    if [ "${POD_API:-pod}" = "runpod_sim" ]; then
+        echo "=== Starting RunPod SDK local API (debug, NO AUTH) on ${POD_API_HOST:-0.0.0.0}:${POD_API_PORT:-8000} ==="
+        exec "$PYTHON_BIN" -u "$WORKER_ROOT/handler.py" --rp_serve_api \
+            --rp_api_host "${POD_API_HOST:-0.0.0.0}" --rp_api_port "${POD_API_PORT:-8000}"
+    fi
+    echo "=== Starting pod job API on ${POD_API_HOST:-0.0.0.0}:${POD_API_PORT:-8000} ==="
+    exec "$PYTHON_BIN" -u /pod/pod_api.py
+fi
+
 echo "=== Starting RunPod Handler ==="
 exec "$PYTHON_BIN" -u "$WORKER_ROOT/handler.py"
