@@ -171,7 +171,18 @@ def apply_fp8_fast(prompt):
     if current != FP8_FROM:
         return f"[FP8] fast requested but node {LOADER_NODE} quantization is {current!r}, not {FP8_FROM!r}; unchanged"
     inputs["quantization"] = FP8_TO
-    return f"[FP8] fast on: node {LOADER_NODE} quantization {FP8_FROM} -> {FP8_TO} (changes numerics, test only)"
+    # v34: WanVideoWrapper raises "fp8_fast is not supported with unmerged LoRAs", so the LoRA feeding the
+    # loader is merged into the weights (slower model load, same sampler cost per step).
+    merged = []
+    lora_link = inputs.get("lora")
+    if isinstance(lora_link, list) and str(lora_link[0]) in prompt:
+        lora = prompt[str(lora_link[0])].setdefault("inputs", {})
+        if lora.get("merge_loras") is not True:
+            lora["merge_loras"] = True
+            merged.append(str(lora_link[0]))
+    note = f", merge_loras on for node {merged[0]}" if merged else ""
+    return (f"[FP8] fast on: node {LOADER_NODE} quantization {FP8_FROM} -> {FP8_TO}{note} "
+            f"(changes numerics, test only)")
 
 
 def steps_per_window(prompt):

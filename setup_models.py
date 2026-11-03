@@ -111,10 +111,24 @@ class HFCacheError(Exception):
     pass
 
 
+BAKED_MODELS_DEFAULT_DIR = "/models_baked"
+
+
 def model_source():
-    """MODEL_SOURCE: "volume" (default) or "hf_cache". Unknown values mean "volume"."""
+    """MODEL_SOURCE: "volume" (default), "hf_cache" or "baked" (v34: models inside the image at
+    BAKED_MODELS_DIR/<folder>/<file>, linked with no copy). Unknown values mean "volume"."""
     raw = os.environ.get("MODEL_SOURCE", "").strip().lower()
-    return raw if raw in ("volume", "hf_cache") else "volume"
+    return raw if raw in ("volume", "hf_cache", "baked") else "volume"
+
+
+def linked_source_dir():
+    """Folder whose files are linked without a copy: the HF snapshot (hf_cache) or BAKED_MODELS_DIR (baked)."""
+    if model_source() == "baked":
+        path = os.environ.get("BAKED_MODELS_DIR", "").strip() or BAKED_MODELS_DEFAULT_DIR
+        if not os.path.isdir(path):
+            raise HFCacheError(f"BAKED_MODELS_DIR {path} not found (image built without baked models?)")
+        return path
+    return hf_snapshot_dir()
 
 
 def hf_cache_fallback():
@@ -162,10 +176,11 @@ def hf_cache_file(snapshot, model_name, subfolder):
 
 
 def upscale_at_startup():
-    """UPSCALE_MODELS_AT_STARTUP; when unset: on with MODEL_SOURCE=volume, off with hf_cache."""
+    """UPSCALE_MODELS_AT_STARTUP; unset = off (v34): SeedVR2 (~7.3 GB) is copied on the first upscale job only,
+    never on cold start. 1 restores the old startup copy."""
     raw = os.environ.get("UPSCALE_MODELS_AT_STARTUP")
     if raw is None or raw.strip() == "":
-        return model_source() != "hf_cache"
+        return False
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
@@ -489,9 +504,9 @@ def ensure_model(model_name, subfolder=None, source_subfolder=None):
     with _ensure_lock:
         start = time.time()
         dest_path, local_path = model_paths(model_name, subfolder)
-        if model_source() == "hf_cache":
+        if model_source() in ("hf_cache", "baked"):
             try:
-                cached = hf_cache_file(hf_snapshot_dir(), model_name, subfolder)
+                cached = hf_cache_file(linked_source_dir(), model_name, subfolder)
             except HFCacheError as e:
                 cached = None
                 _log(f"   ⚠️ [HF_CACHE] {model_name}: {e}; using the volume", err=True)
@@ -637,10 +652,10 @@ def scan_and_link():
     setup_start = time.time()
     source = model_source()
     cached = {}   # model_name -> file in the HF cache snapshot
-    if source == "hf_cache":
-        print(f"\n🗄️ [HF_CACHE] MODEL_SOURCE=hf_cache, repo {os.environ.get('HF_CACHE_REPO', '').strip() or '(unset)'}")
+    if source in ("hf_cache", "baked"):
+        print(f"\n🗄️ [HF_CACHE] MODEL_SOURCE={source}, repo {os.environ.get('HF_CACHE_REPO', '').strip() or '(unset)'}")
         try:
-            snapshot = hf_snapshot_dir()
+            snapshot = linked_source_dir()
             print(f"   snapshot: {snapshot}")
             for model_name, subfolder in MODEL_DESTINATIONS.items():
                 path = hf_cache_file(snapshot, model_name, subfolder)
@@ -680,7 +695,7 @@ def scan_and_link():
 
         # Candidate paths in volume/workspace
         src_found = find_source(model_name, subfolder)
-        if src_found is None and source == "hf_cache" and model_name in LAZY_MODELS:
+        if src_found is None and source in ("hf_cache", "baked") and model_name in LAZY_MODELS:
             print(f"   ⚠️ [LAZY] {model_name} is neither in the HF cache nor on a volume: jobs that need it fail")
             continue
 

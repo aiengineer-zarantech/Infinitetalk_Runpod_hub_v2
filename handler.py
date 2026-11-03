@@ -620,6 +620,11 @@ def handler(job):
     prompt["125"]["inputs"]["audio"] = wav_node_name
     prompt["241"]["inputs"]["positive_prompt"] = prompt_text
 
+    # v34: separate_vocals=false (clean TTS audio) skips MelBandRoFormer
+    from worker_guard import vocals
+    if vocals.wants_skip(job_input):
+        logger.info(f"[VOCALS] separation off: {vocals.skip_vocal_separation(prompt)} audio input(s) rewired")
+
     # 네거티브 프롬프트 + NAG: cfg 1.0에서는 샘플러가 negative 패스를 건너뛰므로
     # WanVideoApplyNAG로 적용. negative_prompt가 없으면 워크플로우는 기존과 동일.
     negative_prompt = job_input.get("negative_prompt")

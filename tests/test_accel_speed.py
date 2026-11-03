@@ -3,6 +3,7 @@
 # scripts/make_compiled_workflows.py, scripts/verify_wrapper_contract.py, gpu_check GPU info file.
 # ==============================================================================
 import base64
+import os
 import io
 import json
 import logging
@@ -342,3 +343,15 @@ def test_gpu_check_writes_info_file(monkeypatch, capsys, tmp_path):
     assert info["name"] == "NVIDIA GeForce RTX 5090" and info["capability"] == "8.9"
     monkeypatch.setenv("WORKER_GPU_INFO", str(info_path))
     assert accel.gpu_info()["total_gb"] == 31.4
+
+
+def test_apply_fp8_fast_merges_the_lora():
+    # v34: fp8_fast with an unmerged LoRA fails in WanVideoModelLoader (seen on the endpoint, 2026-11-03)
+    import json
+    prompt = json.load(open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                         "I2V_single.json")))
+    assert prompt["138"]["inputs"]["merge_loras"] is False
+    msg = accel.apply_fp8_fast(prompt)
+    assert prompt["122"]["inputs"]["quantization"] == "fp8_e4m3fn_fast"
+    assert prompt["138"]["inputs"]["merge_loras"] is True
+    assert "merge_loras on for node 138" in msg

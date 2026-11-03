@@ -278,8 +278,51 @@ def test_ensure_model_prefers_the_cache(env, monkeypatch):
 
 def test_upscale_at_startup_defaults(monkeypatch):
     monkeypatch.delenv("UPSCALE_MODELS_AT_STARTUP", raising=False)
-    assert setup_models.upscale_at_startup() is True
+    assert setup_models.upscale_at_startup() is False   # v34: SeedVR2 lazy by default
     monkeypatch.setenv("MODEL_SOURCE", "hf_cache")
     assert setup_models.upscale_at_startup() is False
     monkeypatch.setenv("UPSCALE_MODELS_AT_STARTUP", "1")
     assert setup_models.upscale_at_startup() is True
+
+
+# v34: MODEL_SOURCE=baked (models inside the image)
+def make_baked(tmp, models=None):
+    root = tmp / "models_baked"
+    for i, name in enumerate(models if models is not None else STARTUP_MODELS):
+        sub = setup_models.MODEL_DESTINATIONS[name]
+        (root / sub).mkdir(parents=True, exist_ok=True)
+        (root / sub / name).write_bytes(bytes([i]) * (400 + i))
+    return root
+
+
+def test_baked_links_every_model_and_copies_nothing(env, monkeypatch, capsys):
+    root = make_baked(env.tmp)
+    monkeypatch.setenv("MODEL_SOURCE", "baked")
+    monkeypatch.setenv("BAKED_MODELS_DIR", str(root))
+    state = track_copies(monkeypatch, delay=0)
+    setup_models.scan_and_link()
+    assert state["copied"] == []
+    for name in STARTUP_MODELS:
+        dest, local = paths(name)
+        sub = setup_models.MODEL_DESTINATIONS[name]
+        assert os.path.realpath(dest) == os.path.realpath(root / sub / name)
+        assert not os.path.exists(local)
+    assert "MODEL_SOURCE=baked" in capsys.readouterr().out
+
+
+def test_baked_missing_file_uses_the_volume(env, monkeypatch):
+    vae = "Wan2_1_VAE_bf16.safetensors"
+    root = make_baked(env.tmp, models=[m for m in STARTUP_MODELS if m != vae])
+    monkeypatch.setenv("MODEL_SOURCE", "baked")
+    monkeypatch.setenv("BAKED_MODELS_DIR", str(root))
+    state = track_copies(monkeypatch, delay=0)
+    setup_models.scan_and_link()
+    assert state["copied"] == [vae]
+
+
+def test_baked_dir_absent_falls_back_to_volume(env, monkeypatch):
+    monkeypatch.setenv("MODEL_SOURCE", "baked")
+    monkeypatch.setenv("BAKED_MODELS_DIR", str(env.tmp / "nope"))
+    state = track_copies(monkeypatch, delay=0)
+    setup_models.scan_and_link()
+    assert sorted(state["copied"]) == sorted(STARTUP_MODELS)
