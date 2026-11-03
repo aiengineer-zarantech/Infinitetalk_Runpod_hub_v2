@@ -139,3 +139,19 @@ def test_load_worker_handler_captures_without_starting(monkeypatch, tmp_path):
     h = pod_api.load_worker_handler(str(tmp_path))
     assert h({"id": "1", "input": {}}) == {"video": "ok"}
     monkeypatch.delitem(sys.modules, "handler", raising=False)
+
+
+def test_health_reports_the_resident_model():
+    store = pod_api.JobStore(lambda job: {}, model_info=lambda: {"lock": True, "resident": True, "loads": 1})
+    c = TestClient(pod_api.create_app(store, TOKEN))
+    assert c.get("/health", headers=AUTH).json()["model"] == {"lock": True, "resident": True, "loads": 1}
+
+
+def test_model_lock_info_reflects_the_state(monkeypatch):
+    from worker_guard import model_lock
+    monkeypatch.setenv("MODEL_LOCK", "1")
+    monkeypatch.setattr(model_lock, "STATE", model_lock.ResidentState())
+    assert pod_api.model_lock_info()["resident"] is False
+    model_lock.STATE.after_job({"a": 1}, ok=True, oom=False, idle_bytes=1, status="cold")
+    info = pod_api.model_lock_info()
+    assert info["resident"] is True and info["loads"] == 1

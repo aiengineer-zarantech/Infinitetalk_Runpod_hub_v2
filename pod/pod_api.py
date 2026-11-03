@@ -39,8 +39,9 @@ def _env_int(name, default):
 class JobStore:
     """FIFO queue + one worker thread. Thread-safe. `handler(job_dict) -> result` is the worker handler."""
 
-    def __init__(self, handler, max_queue=10, ttl_sec=3600, max_finished=50, clock=time.time):
+    def __init__(self, handler, max_queue=10, ttl_sec=3600, max_finished=50, clock=time.time, model_info=None):
         self.handler = handler
+        self.model_info = model_info      # MODEL_LOCK: () -> {"resident": bool, ...} for /health
         self.max_queue = max_queue
         self.ttl_sec = ttl_sec
         self.max_finished = max_finished
@@ -92,7 +93,14 @@ class JobStore:
                 "workers": {"idle": 0 if busy else 1, "ready": 0 if busy else 1, "running": 1 if busy else 0,
                             "initializing": 0, "throttled": 0, "unhealthy": 0},
                 "jobs": {"inQueue": len(self.queue), "inProgress": 1 if busy else 0, **self.counts},
+                **({"model": self._model()} if self.model_info else {}),
             }
+
+    def _model(self):
+        try:
+            return self.model_info()
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
 
     # ------------------------------------------------------------- worker side
     def start(self):
@@ -222,6 +230,16 @@ def load_worker_handler(worker_root="/"):
     return captured["handler"]
 
 
+def model_lock_info():
+    """MODEL_LOCK state of this worker for /health (the UI shows "Model ready (reused)" vs "Loading model")."""
+    from worker_guard import model_lock
+    if not model_lock.enabled():
+        return {"lock": False}
+    st = model_lock.STATE
+    return {"lock": True, "resident": st.signature is not None, "config": model_lock.config_hash(),
+            "loads": st.loads, "reuses": st.reuses}
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     token = os.environ.get("POD_API_TOKEN", "").strip()
@@ -230,7 +248,8 @@ def main():
     host = os.environ.get("POD_API_HOST", "0.0.0.0")
     port = _env_int("POD_API_PORT", 8000)
     store = JobStore(load_worker_handler(os.environ.get("WORKER_ROOT") or "/"),
-                     max_queue=_env_int("POD_MAX_QUEUE", 10), ttl_sec=_env_int("POD_JOB_TTL_SEC", 3600))
+                     max_queue=_env_int("POD_MAX_QUEUE", 10), ttl_sec=_env_int("POD_JOB_TTL_SEC", 3600),
+                     model_info=model_lock_info)
     store.start()
     import uvicorn
     logger.info(f"[POD] job API on {host}:{port} (auth on, queue {store.max_queue}, ttl {store.ttl_sec}s)")

@@ -32,6 +32,9 @@ fi
 cp -f "$REPO/handler.py" "$REPO/setup_models.py" "$REPO/entrypoint.sh" /
 cp -f "$REPO"/worker_guard/*.py /worker_guard/
 mkdir -p /pod && cp -f "$REPO/pod/pod_api.py" /pod/
+# MODEL_LOCK: locked config + the zz_worker_mem node (clear non-model memory without unloading the model)
+cp -f "$REPO/locked_model_config.json" /
+mkdir -p /ComfyUI/custom_nodes/zz_worker_mem && cp -f "$REPO/comfy_mem/__init__.py" /ComfyUI/custom_nodes/zz_worker_mem/
 sed -i 's/\r$//' /handler.py /setup_models.py /entrypoint.sh /worker_guard/*.py /pod/pod_api.py
 chmod 755 /entrypoint.sh /setup_models.py
 rm -rf /worker_guard/__pycache__ /__pycache__
