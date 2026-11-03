@@ -1,6 +1,7 @@
 """Small ComfyUI HTTP helpers (urllib only, explicit timeouts, no secrets involved)."""
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -82,3 +83,17 @@ def object_info(node_class, timeout=30):
 
 def list_models(folder, timeout=30):
     return _get_json(f"/models/{urllib.parse.quote(folder)}", timeout)
+
+
+def clear_cache(timeout=30):
+    """POST /worker/clear_cache (zz_worker_mem node): gc + empty_cache in ComfyUI, models stay loaded.
+    Returns the node's before/after memory dict, or None when the node is not installed (HTTP 404)."""
+    req = urllib.request.Request(base_url() + "/worker/clear_cache", data=b"{}", method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
