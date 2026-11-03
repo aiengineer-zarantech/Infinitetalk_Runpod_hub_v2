@@ -11,6 +11,8 @@
 # - fp8_fast (benchmark jobs / FP8_FAST=1) also sets merge_loras=true (it failed with unmerged LoRAs).
 # - Every video job logs [PROFILE] per node and one "[TIMING] stages:" line; benchmark jobs return a
 #   "timing" dict (windows, s/it, stages) next to the video.
+# - MODEL_LOCK (default on, MODEL_LOCK.md): locked_model_config.json, worker_guard/model_lock.py and the
+#   zz_worker_mem node (custom_nodes/zz_worker_mem: gc + empty_cache without unloading the model).
 # All of v33 is included (resilient copy, ComfyUI-Manager off).
 #
 # Build: see BUILD_V34.md. Push only to a PRIVATE repository: the v32 base keeps an old layer with a
@@ -29,26 +31,31 @@ RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
       "0c3c2fca33fa6813796429bec0e2918034bc3994b0a3121fb0a7e31d7e1953c5  /worker_guard/accel.py" \
       "3592ee7a0731e6e51c64fb4d3e9f28209f9d0ea8b72fd8e988933b6ccf9c8a9c  /worker_guard/node_timer.py" \
       "62fede151ccccfc8bafd02c80eb9b5950826f11c03a6db3d1636c7c09c574b7e  /worker_guard/job_guard.py" \
+      "ec3f3f44a95065e89e611c37c38e1270e022a59cce4bb032dfc10d1165117375  /worker_guard/comfy_api.py" \
       | sha256sum -c --quiet && \
-    test ! -e /worker_guard/vocals.py && \
+    test ! -e /worker_guard/vocals.py && test ! -e /worker_guard/model_lock.py && \
+    test ! -e /ComfyUI/custom_nodes/zz_worker_mem && \
     sha256sum /extra_model_paths.yaml /Upscale_SeedVR2.json \
         /I2V_single.json /I2V_multi.json /V2V_single.json /V2V_multi.json \
         /I2V_single_compiled.json /I2V_multi_compiled.json > /tmp/unchanged.sha256 && \
     find /worker_guard -type f -name '*.py' \
-        -not -name accel.py -not -name node_timer.py -not -name job_guard.py -print0 \
+        -not -name accel.py -not -name node_timer.py -not -name job_guard.py -not -name comfy_api.py -print0 \
         | sort -z | xargs -0 sha256sum >> /tmp/unchanged.sha256 && \
     find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes.sha256 && \
     find /ComfyUI/comfy /ComfyUI/comfy_extras -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum > /tmp/comfy_core.sha256 && \
     rm -f /test_worker_diag.py /test_mutations.py /download_all_models.py
 
 # 2. v34 code
-COPY handler.py setup_models.py entrypoint.sh /
-COPY worker_guard/accel.py worker_guard/node_timer.py worker_guard/job_guard.py worker_guard/vocals.py /worker_guard/
+COPY handler.py setup_models.py entrypoint.sh locked_model_config.json /
+COPY worker_guard/accel.py worker_guard/node_timer.py worker_guard/job_guard.py worker_guard/vocals.py \
+     worker_guard/comfy_api.py worker_guard/model_lock.py /worker_guard/
+COPY comfy_mem/__init__.py /ComfyUI/custom_nodes/zz_worker_mem/__init__.py
 RUN sed -i 's/\r$//' /handler.py /setup_models.py /entrypoint.sh /worker_guard/*.py && \
     chmod 755 /setup_models.py /entrypoint.sh && bash -n /entrypoint.sh && \
-    cd / && MODEL_SOURCE=hf_cache python -c "import setup_models, worker_guard.job_guard, worker_guard.vocals; \
+    cd / && MODEL_SOURCE=hf_cache python -c "import setup_models, worker_guard.job_guard, worker_guard.vocals, worker_guard.model_lock as ml; \
 assert setup_models.model_source() == 'hf_cache' and not setup_models.upscale_at_startup() and setup_models.hf_cache_fallback(); \
-print('v34 imports OK')" && \
+assert ml.enabled() and ml.config()['blocks_to_swap'] == 0; \
+print('v34 imports OK, model lock config', ml.config_hash())" && \
     rm -rf /worker_guard/__pycache__ /__pycache__
 
 ENV MODEL_SOURCE=hf_cache \
@@ -57,7 +64,7 @@ ENV MODEL_SOURCE=hf_cache \
 
 # 3. LAST RUN STEP: unchanged files + custom nodes + ComfyUI core, zero package drift
 RUN sha256sum -c --quiet /tmp/unchanged.sha256 && \
-    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes_post.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -not -path '*/zz_worker_mem/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes_post.sha256 && \
     diff -u /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
     find /ComfyUI/comfy /ComfyUI/comfy_extras -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum > /tmp/comfy_core_post.sha256 && \
     diff -u /tmp/comfy_core.sha256 /tmp/comfy_core_post.sha256 && \
@@ -67,4 +74,4 @@ RUN sha256sum -c --quiet /tmp/unchanged.sha256 && \
         exit 1; \
     } && \
     rm -f /tmp/comfy_freeze_*.txt /tmp/unchanged.sha256 /tmp/custom_nodes*.sha256 /tmp/comfy_core*.sha256 && \
-    echo "OK: v34 built. Only handler/setup_models/entrypoint + 4 worker_guard files changed. Zero package drift."
+    echo "OK: v34 built. Only handler/setup_models/entrypoint + 6 worker_guard files + zz_worker_mem added/changed. Zero package drift."

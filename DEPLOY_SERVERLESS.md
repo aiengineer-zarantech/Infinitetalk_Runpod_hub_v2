@@ -41,6 +41,7 @@ make sure the old key is revoked in the RunPod console.
 | GPU | RTX 5090 (32 GB). The worker rejects GPUs under 28 GB (`gpu_check`) |
 | Active workers | 0 (each active worker is billed while idle) |
 | Max workers | 4 or more (one per parallel chunk) |
+| Diagnostics / A-B | a SEPARATE endpoint with `MODEL_LOCK=0`, never this one |
 | Idle timeout | short (5-60 s) unless warm hits matter more than idle billing |
 | Execution timeout | at least 20 min (a 15 s chunk takes ~7-8 min warm) |
 | FlashBoot | on |
@@ -59,6 +60,8 @@ make sure the old key is revoked in the RunPod console.
 | `UPSCALE_MODELS_AT_STARTUP` | unset (= 0) | SeedVR2 on the first upscale job only |
 | `COMFYUI_MANAGER` | unset (= 0) | no startup network calls |
 | `HF_CACHE_REPO` / `HF_CACHE_FALLBACK` | unset / `1` | hf_cache only |
+| `MODEL_LOCK` | unset (= 1) | load once, never reload (MODEL_LOCK.md). `0` only on a separate diagnostics endpoint |
+| `ALLOC_MODE` | unset | under the lock = `native_expandable` (expandable segments); `cuda_malloc` = ComfyUI default |
 
 Backend env (backend repo, `deploy/serverless`): `RUNPOD_API_KEY`, `ENDPOINT_ID`, `PARALLEL_CHUNKS_ENABLED=1`,
 `PARALLEL_MAX_CHUNKS=4`, no `POD_BASE_URL`.
