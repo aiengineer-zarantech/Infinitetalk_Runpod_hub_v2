@@ -139,9 +139,18 @@ def hf_snapshot_dir():
     """The snapshot folder of HF_CACHE_REPO: HF_CACHE_REVISION, else refs/main, else the only snapshot.
     Raises HFCacheError with a message that says what is missing."""
     repo = os.environ.get("HF_CACHE_REPO", "").strip()
+    root = os.environ.get("HF_CACHE_ROOT", "").strip() or HF_CACHE_DEFAULT_ROOT
+    if not repo:
+        # v34: RunPod caches one model per endpoint, so a single models--<org>--<name> folder is that repo
+        try:
+            found = sorted(d for d in os.listdir(root) if d.startswith("models--") and d.count("--") == 2)
+        except OSError:
+            found = []
+        if len(found) != 1:
+            raise HFCacheError(f"HF_CACHE_REPO unset and {len(found)} cached repos in {root}: {found}")
+        repo = found[0][len("models--"):].replace("--", "/")
     if repo.count("/") != 1 or repo.startswith("/") or repo.endswith("/"):
         raise HFCacheError(f"HF_CACHE_REPO must be <org>/<name> (got {repo!r})")
-    root = os.environ.get("HF_CACHE_ROOT", "").strip() or HF_CACHE_DEFAULT_ROOT
     base = os.path.join(root, "models--" + repo.replace("/", "--"))
     snapshots = os.path.join(base, "snapshots")
     if not os.path.isdir(snapshots):

@@ -1,70 +1,70 @@
 # ==============================================================================
-# Dockerfile.v34 - models BAKED into the image, SeedVR2 lazy, separate_vocals=false (branch perf/5090-speedup)
+# Dockerfile.v34 - MODEL_SOURCE=hf_cache default, SeedVR2 lazy, vocal skip, fp8 fix, timing (perf/5090-speedup)
 # ==============================================================================
-# - The 8 startup models (~29.3 GB) + InfiniteTalk Multi (2.7 GB) are downloaded from their public
-#   huggingface.co sources at BUILD time into /models_baked/<folder>/<file>, size checked, one layer per big file.
-#   MODEL_SOURCE=baked links them into /ComfyUI/models with no copy: cold start no longer reads ~29 GB from
-#   the network volume. A missing baked file falls back to the volume (HF_CACHE_FALLBACK=1).
-# - SeedVR2 (3b + VAE, ~7.3 GB) is no longer copied at startup: first upscale job only
-#   (UPSCALE_MODELS_AT_STARTUP=1 restores the old behaviour).
-# - separate_vocals=false in the job input skips MelBandRoFormer (backend TTS_SKIP_VOCAL_SEPARATION=1).
-# - Includes all of v33 (resilient copy, hf_cache, ComfyUI-Manager off).
+# Overlay on v32 by digest (like v33). Adds no models and installs nothing: image size stays ~v32.
+# - MODEL_SOURCE=hf_cache: the 8 startup models are linked from the endpoint's RunPod Cached Model
+#   (/runpod-volume/huggingface-cache/hub/models--<org>--<name>/snapshots/<hash>/<folder>/<file>), no copy.
+#   HF_CACHE_REPO may stay unset: the only cached repo is used. A missing file or no cache at all falls back
+#   to the network volume copy (HF_CACHE_FALLBACK=1). InfiniteTalk Multi stays lazy (volume or cache).
+# - SeedVR2 (~7.3 GB) is copied on the first upscale job only (UPSCALE_MODELS_AT_STARTUP=1 = old behaviour).
+# - separate_vocals=false skips MelBandRoFormer (backend TTS_SKIP_VOCAL_SEPARATION=1 sends it for TTS audio).
+# - fp8_fast (benchmark jobs / FP8_FAST=1) also sets merge_loras=true (it failed with unmerged LoRAs).
+# - Every video job logs [PROFILE] per node and one "[TIMING] stages:" line; benchmark jobs return a
+#   "timing" dict (windows, s/it, stages) next to the video.
+# All of v33 is included (resilient copy, ComfyUI-Manager off).
 #
-# Build host needs ~110 GB free Docker storage (base ~34 GB + models ~32 GB + layer export). Image ~66 GB.
-#   docker build -f Dockerfile.v34 -t <registry>/infinitetalk-runpod:v34 .
-#
-# SECURITY: the v32 base still has an old layer with a RunPod key in test_worker_diag.py / test_mutations.py /
-# download_all_models.py. They are deleted below, but a deleted file stays readable in the lower layer.
-# Make sure that key is revoked in the RunPod console, and push v34 to a PRIVATE repository.
+# Build: see BUILD_V34.md. Push only to a PRIVATE repository: the v32 base keeps an old layer with a
+# RunPod key in three dev scripts (deleted below, still readable in the lower layer).
 ARG BASE_IMAGE=digamberjhazaran/infinitetalk-runpod@sha256:423a8e0cd3a42ca4d26d82fffbae3292f76dcd0ba988a0280bfb703bc4970652
 FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-c"]
 
-# 1. The files replaced below must be the v32 ones
-RUN echo "8fe96d8694a504d5ac643429e03be9a85c857828c31a74f501ba093663734d55  /setup_models.py" | sha256sum -c --quiet && \
-    echo "51ee2f6ac2d8d0f260ffda93052317400154198a5075fbdce79d81b2664aaabe  /entrypoint.sh" | sha256sum -c --quiet && \
-    echo "07b8f9bc4574aff6990ce7e1bbb50d314fd8eeda5d39fdfdd99e0deed28d56fe  /handler.py" | sha256sum -c --quiet && \
-    /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
+# 1. Baseline: every file replaced below must be the v32 one; everything else is fingerprinted
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
+    printf '%s\n' \
+      "07b8f9bc4574aff6990ce7e1bbb50d314fd8eeda5d39fdfdd99e0deed28d56fe  /handler.py" \
+      "8fe96d8694a504d5ac643429e03be9a85c857828c31a74f501ba093663734d55  /setup_models.py" \
+      "51ee2f6ac2d8d0f260ffda93052317400154198a5075fbdce79d81b2664aaabe  /entrypoint.sh" \
+      "0c3c2fca33fa6813796429bec0e2918034bc3994b0a3121fb0a7e31d7e1953c5  /worker_guard/accel.py" \
+      "3592ee7a0731e6e51c64fb4d3e9f28209f9d0ea8b72fd8e988933b6ccf9c8a9c  /worker_guard/node_timer.py" \
+      "62fede151ccccfc8bafd02c80eb9b5950826f11c03a6db3d1636c7c09c574b7e  /worker_guard/job_guard.py" \
+      | sha256sum -c --quiet && \
+    test ! -e /worker_guard/vocals.py && \
+    sha256sum /extra_model_paths.yaml /Upscale_SeedVR2.json \
+        /I2V_single.json /I2V_multi.json /V2V_single.json /V2V_multi.json \
+        /I2V_single_compiled.json /I2V_multi_compiled.json > /tmp/unchanged.sha256 && \
+    find /worker_guard -type f -name '*.py' \
+        -not -name accel.py -not -name node_timer.py -not -name job_guard.py -print0 \
+        | sort -z | xargs -0 sha256sum >> /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes.sha256 && \
+    find /ComfyUI/comfy /ComfyUI/comfy_extras -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum > /tmp/comfy_core.sha256 && \
     rm -f /test_worker_diag.py /test_mutations.py /download_all_models.py
 
-# 2. Baked models. fetch <url> <folder> <expected bytes>
-RUN printf '%s\n' '#!/bin/bash' 'set -euo pipefail' \
-      'url="$1"; dir="/models_baked/$2"; want="$3"; f="$dir/$(basename "${url%%\?*}")"' \
-      'mkdir -p "$dir"' \
-      'curl -fL --retry 8 --retry-all-errors --retry-delay 5 -C - -o "$f" "$url"' \
-      'have=$(stat -c %s "$f"); [ "$have" = "$want" ] || { echo "SIZE MISMATCH $f: $have != $want"; exit 1; }' \
-      'echo "baked $f ($have bytes)"' > /usr/local/bin/fetch_model && chmod 755 /usr/local/bin/fetch_model
-ARG HF=https://huggingface.co
-RUN fetch_model $HF/Kijai/WanVideo_comfy/resolve/main/Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors diffusion_models 16993877896
-RUN fetch_model $HF/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-fp8_e4m3fn.safetensors text_encoders 6731333792
-RUN fetch_model $HF/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/InfiniteTalk/Wan2_1-InfiniteTalk-Single_fp8_e4m3fn_scaled_KJ.safetensors diffusion_models 2713548210
-RUN fetch_model $HF/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/InfiniteTalk/Wan2_1-InfiniteTalk-Multi_fp8_e4m3fn_scaled_KJ.safetensors diffusion_models 2712729090
-RUN fetch_model $HF/Comfy-Org/Wan-2.1/resolve/main/split_files/clip_vision/clip_vision_h.safetensors clip_vision 1264219396 && \
-    fetch_model $HF/Kijai/WanVideo_comfy/resolve/main/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors loras 738005744 && \
-    fetch_model $HF/Kijai/MelBandRoFormer_comfy/resolve/main/MelBandRoformer_fp16.safetensors diffusion_models 456479072 && \
-    fetch_model $HF/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors vae 253806278 && \
-    fetch_model $HF/Kijai/wav2vec2_safetensors/resolve/main/wav2vec2-chinese-base_fp16.safetensors diffusion_models 190115368
-
-# 3. v34 code
-COPY setup_models.py /setup_models.py
-COPY entrypoint.sh /entrypoint.sh
-COPY handler.py /handler.py
-COPY worker_guard/vocals.py /worker_guard/vocals.py
-RUN sed -i 's/\r$//' /setup_models.py /entrypoint.sh /handler.py && chmod 755 /setup_models.py /entrypoint.sh && \
-    bash -n /entrypoint.sh && \
-    cd / && MODEL_SOURCE=baked python -c "import setup_models, worker_guard.vocals as v; \
-assert setup_models.model_source() == 'baked' and not setup_models.upscale_at_startup(); \
-d = setup_models.linked_source_dir(); \
-missing = [m for m, s in setup_models.MODEL_DESTINATIONS.items() if not setup_models.hf_cache_file(d, m, s)]; \
-assert not missing, missing; print('baked models OK in', d)" && \
+# 2. v34 code
+COPY handler.py setup_models.py entrypoint.sh /
+COPY worker_guard/accel.py worker_guard/node_timer.py worker_guard/job_guard.py worker_guard/vocals.py /worker_guard/
+RUN sed -i 's/\r$//' /handler.py /setup_models.py /entrypoint.sh /worker_guard/*.py && \
+    chmod 755 /setup_models.py /entrypoint.sh && bash -n /entrypoint.sh && \
+    cd / && MODEL_SOURCE=hf_cache python -c "import setup_models, worker_guard.job_guard, worker_guard.vocals; \
+assert setup_models.model_source() == 'hf_cache' and not setup_models.upscale_at_startup() and setup_models.hf_cache_fallback(); \
+print('v34 imports OK')" && \
     rm -rf /worker_guard/__pycache__ /__pycache__
 
-ENV MODEL_SOURCE=baked \
-    BAKED_MODELS_DIR=/models_baked \
+ENV MODEL_SOURCE=hf_cache \
+    HF_CACHE_FALLBACK=1 \
     UPSCALE_MODELS_AT_STARTUP=0
 
-# 4. Zero package drift
-RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
-    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt && rm -f /tmp/comfy_freeze_*.txt && \
-    echo "OK: v34 built, zero package drift"
+# 3. LAST RUN STEP: unchanged files + custom nodes + ComfyUI core, zero package drift
+RUN sha256sum -c --quiet /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes_post.sha256 && \
+    diff -u /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
+    find /ComfyUI/comfy /ComfyUI/comfy_extras -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum > /tmp/comfy_core_post.sha256 && \
+    diff -u /tmp/comfy_core.sha256 /tmp/comfy_core_post.sha256 && \
+    /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "CRITICAL ERROR: files, custom nodes, ComfyUI core or the Python environment changed during the v34 build!"; \
+        exit 1; \
+    } && \
+    rm -f /tmp/comfy_freeze_*.txt /tmp/unchanged.sha256 /tmp/custom_nodes*.sha256 /tmp/comfy_core*.sha256 && \
+    echo "OK: v34 built. Only handler/setup_models/entrypoint + 4 worker_guard files changed. Zero package drift."

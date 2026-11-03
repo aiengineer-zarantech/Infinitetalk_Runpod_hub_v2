@@ -822,6 +822,25 @@ def _unload_if_model_changes(ctx, prompt):
     _loader_sig = sig
 
 
+def job_timing(ctx):
+    """v34: benchmark jobs return this next to the video, so a test reads the split without worker logs."""
+    sp, nodes = getattr(ctx, "speed", None), getattr(ctx, "nodes", None)
+    first = sp.first_step_overhead() if sp else None
+    avg = sp.avg_s_per_it() if sp else None
+    sampling = sp.sampling_sec() if sp else None
+    gen = getattr(ctx, "gen_sec", None)
+    return {
+        "windows": [{"index": i, "sec": round(w, 2), "s_per_it": round(it, 3)} for i, w, it in sp.windows] if sp else [],
+        "steps_per_window": sp.spw if sp else None,
+        "avg_s_per_it": round(avg, 3) if avg is not None else None,
+        "first_step_overhead_sec": round(first, 2) if first is not None else None,
+        "sampling_sec": round(sampling, 2) if sampling is not None else None,
+        "stages_sec": nodes.stages(ctx.node_classes) if nodes else {},
+        "comfy_total_sec": round(gen, 2) if gen is not None else None,
+        "fp8_fast": bool(getattr(ctx, "fp8_fast", False)),
+    }
+
+
 def _end_of_video_job(ctx, result):
     """Adaptive line, the per-mode [JOB] line, and what our models now hold in VRAM (for the next job)."""
     global _resident_used
@@ -1168,6 +1187,8 @@ def install(handler, get_videos):
                     result = _post_process(ctx, result, upscale_settings, job_input)
                 else:
                     result = {k: v for k, v in result.items() if k != "_video_file"}
+            if ctx.benchmark and isinstance(result, dict) and not result.get("error"):
+                result = {**result, "timing": job_timing(ctx)}
             return result
         finally:
             _current = None
@@ -1214,7 +1235,7 @@ def install(handler, get_videos):
         logger.info(_accel_line(ctx))
         _unload_if_model_changes(ctx, prompt)
         ctx.speed = SpeedTracker(accel.steps_per_window(prompt), accel.SAMPLER_NODE)
-        ctx.nodes = NodeTimer() if accel.env_flag("PROFILE", False) else None
+        ctx.nodes = NodeTimer()   # v34: always on ([TIMING] stages line; timing dict on benchmark jobs)
         ctx.cached_nodes = set()
         watchdog = Watchdog(ctx, ws)
         watchdog.start()
@@ -1225,7 +1246,9 @@ def install(handler, get_videos):
             ctx.gen_sec = _now() - started
             watchdog.stop()
             if ctx.nodes is not None:
-                ctx.nodes.log(ctx.node_classes)
+                if accel.env_flag("PROFILE", False):
+                    ctx.nodes.log(ctx.node_classes)
+                ctx.nodes.log_stages(ctx.node_classes)
             try:
                 ctx.vram = comfy_api.vram_stages()
             except Exception as e:

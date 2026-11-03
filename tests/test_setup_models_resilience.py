@@ -326,3 +326,18 @@ def test_baked_dir_absent_falls_back_to_volume(env, monkeypatch):
     state = track_copies(monkeypatch, delay=0)
     setup_models.scan_and_link()
     assert sorted(state["copied"]) == sorted(STARTUP_MODELS)
+
+
+def test_hf_cache_repo_autodetected_when_unset(env, monkeypatch):
+    root, snap = make_cache(env.tmp)
+    monkeypatch.setenv("MODEL_SOURCE", "hf_cache")
+    monkeypatch.delenv("HF_CACHE_REPO", raising=False)
+    monkeypatch.setenv("HF_CACHE_ROOT", str(root))
+    assert setup_models.hf_snapshot_dir() == str(snap)
+
+
+def test_hf_cache_repo_unset_and_no_cache_raises(env, monkeypatch):
+    monkeypatch.delenv("HF_CACHE_REPO", raising=False)
+    monkeypatch.setenv("HF_CACHE_ROOT", str(env.tmp / "empty"))
+    with pytest.raises(setup_models.HFCacheError, match="0 cached repos"):
+        setup_models.hf_snapshot_dir()
