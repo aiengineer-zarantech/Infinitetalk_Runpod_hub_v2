@@ -16,6 +16,7 @@
   "offload_txt_emb": false,
   "max_width": 854,
   "max_height": 480,
+  "max_frames": 1615,
   "vram": {
     "headroom_gb": 2.5,
     "sampler_peak_gb": 22.4,
@@ -23,6 +24,7 @@
     "tiled_decode_gb": 1.5,
     "cold_idle_gb": 1.0,
     "garbage_clear_above_gb": 1.0,
+    "max_frames_note": "2026-11-03 MODEL_LOCK test on the pod: 831 frames OK (peak 25.0 GB), 3081 frames (2 min) OOM inside the sampler before the first step (31.3 GB): the sampler cost grows with the frame count, not only the final decode. 1615 frames (61 s audio) is the longest job that ran without an OOM, so longer jobs are refused before queueing; the backend splits long audio into <= 60 s chunks that run one after another on the same worker.",
     "measured": "2026-11-03, pod b98p0yq88j1lel, RTX 5090 31.4 GB, v32, 854x480, blocks_to_swap 0, force_offload false, compile on: 1615 frames (22 windows), watchdog peak 22.4 GB during sampling, stage peak 25.9 GB (83%) = 5.5 GB headroom. blocks_to_swap 0 is the lowest value, so it is locked. decode_gb_per_frame = (25.9 - 22.4) / 1615, a one-point linear estimate of the final VAE decode: re-measure with a 2 min job."
   }
 }

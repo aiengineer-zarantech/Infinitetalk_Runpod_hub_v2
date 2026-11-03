@@ -164,6 +164,15 @@ def preflight(prompt, device, resident_idle_bytes, clear_cache, read_device, cfg
     n = frames(prompt)
     total = device["vram_total"] / GB
     report = {"frames": n, "total_gb": round(total, 2), "cleared": False, "tiled": False}
+    max_frames = cfg.get("max_frames")
+    if max_frames and n and n > max_frames:
+        report.update(ok=False, too_long=True, projected_peak_gb=None, headroom_gb=None,
+                      vram_used_start_gb=round((device["vram_total"] - device["vram_free"]) / GB, 2), non_model_gb=None,
+                      message=(f"[MODEL_LOCK] {n} frames is longer than the locked maximum {max_frames} frames "
+                               f"(about {(max_frames - 81) / 25:.0f} s of audio): the sampler would run out of VRAM "
+                               "(2 min jobs did). Split the audio into <= 60 s parts (the backend does this in pod mode); "
+                               "the model stays loaded"))
+        return report
 
     def projected(dev, tiled):
         used = (dev["vram_total"] - dev["vram_free"]) / GB
