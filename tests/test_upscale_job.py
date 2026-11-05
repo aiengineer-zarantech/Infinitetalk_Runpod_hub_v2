@@ -115,7 +115,8 @@ def test_no_upscale_stage(mocked_comfy, upscale_ok, frees, extra):
 @pytest.mark.parametrize("extra, message", [
     ({"upscale": "720p"}, "upscale is only available with mode 'fast480' or 'upscale_only'"),
     ({"mode": "standard", "upscale": "720p"}, "upscale is only available"),
-    ({"mode": "fast480", "upscale": "1080p"}, "upscale must be '720p' or 'none'"),
+    ({"mode": "fast480", "upscale": "1080p"}, "upscale '1080p' is only available with mode 'upscale_only'"),
+    ({"mode": "fast480", "upscale": "4k"}, "upscale must be '720p', '1080p' or 'none'"),
     ({"mode": "fast480", "upscale_model": "13b"}, "upscale_model must be one of ['3b', '7b']"),
     ({"mode": "upscale_only"}, "upscale_only needs one of ['video_base64', 'video_url', 'video_path']"),
 ])

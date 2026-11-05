@@ -8,6 +8,9 @@ Runs after the InfiniteTalk generation ("mode": "fast480") or alone ("mode": "up
   source audio unchanged (-c:a copy).
 - Frame count, frame rate, size and the audio packets must equal the source, else UpscaleError.
 - The frozen-frame check (ComfyUI issue #16591: near-frozen frames every 4th frame) only logs.
+v36 ("upscale": "1080p", upscale_only): the target is an exact size (upscale_width x upscale_height, default
+1920x1080 / 1080x1920) instead of the 720p rule; the RAM per frame grows with the target pixels, and
+"upscale_crf" sets the crf of the result.
 An out-of-memory error retries only that segment with smaller temporal chunks and VAE tiles; the InfiniteTalk
 generation is never re-run for it.
 """
@@ -26,7 +29,7 @@ import uuid
 from dataclasses import dataclass, field
 from fractions import Fraction
 
-from worker_guard import comfy_api, sysmem
+from worker_guard import comfy_api, modes, sysmem
 
 logger = logging.getLogger("worker_guard")
 
@@ -49,7 +52,9 @@ CONTEXT_FRAMES = 8
 SEGMENT_MIN, SEGMENT_MAX = 33, 401
 SEGMENT_UNKNOWN_RAM = 97
 RAM_MARGIN_GB = 4.0
-DEFAULT_RAM_PER_FRAME_MB = 150.0
+DEFAULT_RAM_PER_FRAME_MB = 150.0   # measured at 1280x720; scaled by the target pixels (v36)
+DEFAULT_RAM_PIXELS = 1280 * 720
+DEFAULT_CRF = 19
 COLOR_METHODS = ("lab", "wavelet", "adain", "none")
 
 # Frozen-frame check: grayscale at this size; a frame is suspicious when the source moves more than
@@ -207,13 +212,16 @@ def audio_md5(path):
     return out or None
 
 
-def target_size(width, height):
-    """1280x720 for landscape, 720x1280 for portrait. Raises if the aspect is far from 16:9 / 9:16."""
-    target = LANDSCAPE if width >= height else PORTRAIT
+def target_size(width, height, requested=None):
+    """1280x720 for landscape, 720x1280 for portrait, or the requested (w, h) (v36 "1080p").
+    Raises if the input aspect is far from the target's."""
+    target = tuple(requested) if requested else (LANDSCAPE if width >= height else PORTRAIT)
     error = abs((width / height) / (target[0] / target[1]) - 1)
     if error > MAX_ASPECT_ERROR:
         raise UpscaleError(f"input {width}x{height} is {error:.1%} away from {target[0]}:{target[1]} "
-                           f"(max {MAX_ASPECT_ERROR:.0%}); upscale supports 16:9 and 9:16 only")
+                           f"(max {MAX_ASPECT_ERROR:.0%}); "
+                           + ("crop or pad the input to the target aspect first" if requested
+                              else "upscale supports 16:9 and 9:16 only"))
     return target
 
 
@@ -227,13 +235,17 @@ def center_crop(width, height, target):
 
 # ------------------------------------------------------------------------------------------------ segments
 
-def ram_per_frame_mb():
+def ram_per_frame_mb(target=None):
+    """UPSCALE_RAM_PER_FRAME_MB, else the 720p measurement scaled up by the target pixels (never down)."""
+    default = DEFAULT_RAM_PER_FRAME_MB
+    if target:
+        default *= max(1.0, target[0] * target[1] / DEFAULT_RAM_PIXELS)
     raw = os.environ.get("UPSCALE_RAM_PER_FRAME_MB", "").strip()
     try:
-        value = float(raw) if raw else DEFAULT_RAM_PER_FRAME_MB
+        value = float(raw) if raw else default
     except ValueError:
-        logger.warning(f"[UPSCALE] invalid UPSCALE_RAM_PER_FRAME_MB={raw!r}, using {DEFAULT_RAM_PER_FRAME_MB:.0f}")
-        value = DEFAULT_RAM_PER_FRAME_MB
+        logger.warning(f"[UPSCALE] invalid UPSCALE_RAM_PER_FRAME_MB={raw!r}, using {default:.0f}")
+        value = default
     return max(1.0, value)
 
 
@@ -340,7 +352,7 @@ def run_prompt(prompt, remaining):
 
 # ------------------------------------------------------------------------------------------------ assembly
 
-def assemble(segment_files, segments, source_path, source, out_path):
+def assemble(segment_files, segments, source_path, source, out_path, crf=DEFAULT_CRF):
     """Core frames of every segment, in order, at the source frame rate; source audio copied unchanged."""
     rate = Fraction(source.fps)
     cmd = ["ffmpeg", "-y", "-v", "error"]
@@ -355,7 +367,7 @@ def assemble(segment_files, segments, source_path, source, out_path):
     parts.append(f"{joined}concat=n={len(segments)}:v=1:a=0,"
                  f"setpts=N*{rate.denominator}/{rate.numerator}/TB[v]")
     cmd += ["-filter_complex", ";".join(parts), "-map", "[v]", "-map", f"{len(segments)}:a:0?",
-            "-c:v", "libx264", "-crf", "19", "-pix_fmt", "yuv420p", "-r", source.fps, "-vsync", "cfr",
+            "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", "-r", source.fps, "-vsync", "cfr",
             "-c:a", "copy", "-movflags", "+faststart", out_path]
     _run(cmd, timeout=3600)
 
@@ -420,8 +432,18 @@ def frozen_frame_line(frames, total):
             f"by frame%4: {'/'.join(str(c) for c in by_mod)}; first: {first})")
 
 
+def check_size(target):
+    """Grayscale size of the frozen-frame check: the 720p table, else long side 320 (even sides)."""
+    target = tuple(target)
+    if target in CHECK_SIZES:
+        return CHECK_SIZES[target]
+    w, h = target
+    scale = 320 / max(w, h)
+    return max(2, round(w * scale / 2) * 2), max(2, round(h * scale / 2) * 2)
+
+
 def frozen_check(source_path, source, out_path, target):
-    size = CHECK_SIZES[tuple(target)]
+    size = check_size(target)
     src = motion(source_path, size, center_crop(source.width, source.height, target))
     res = motion(out_path, size)
     if len(src) != len(res):
@@ -561,14 +583,15 @@ def run(source_path, model_key, out_path, remaining, job_input=None):
     if color not in COLOR_METHODS:
         raise UpscaleError(f"upscale_color_correction must be one of {list(COLOR_METHODS)}")
 
+    crf = int(job_input.get("upscale_crf", DEFAULT_CRF))
     source = probe(source_path)
-    target = target_size(source.width, source.height)
+    target = target_size(source.width, source.height, modes.requested_size(job_input, source.width, source.height))
     logger.info(f"[UPSCALE] source {source.width}x{source.height}, {source.frames} frames at {source.fps} fps, "
                 f"audio {'yes' if source.has_audio else 'no'} -> {target[0]}x{target[1]}, model {model_file}")
     ensure_models(model_key, remaining)
 
     ram = sysmem.read_ram()
-    per_frame = ram_per_frame_mb()
+    per_frame = ram_per_frame_mb(target)
     size = segment_frames(ram.get("available"), per_frame, job_input.get("upscale_segment_frames"))
     segments = plan_segments(source.frames, size)
     available = "n/a" if ram.get("available") is None else f"{ram['available'] / GB:.1f} GB"
@@ -628,7 +651,7 @@ def run(source_path, model_key, out_path, remaining, job_input=None):
                 break
 
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-        assemble(segment_files, segments, source_path, source, out_path)
+        assemble(segment_files, segments, source_path, source, out_path, crf)
         verify(source_path, source, out_path, target)
     finally:
         peaks.stop()

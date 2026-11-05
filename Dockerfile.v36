@@ -1,0 +1,62 @@
+# ==============================================================================
+# Dockerfile.v36 - v35 + SeedVR2 1080p upscale for the Studio's separate UPSCALE endpoint
+# ==============================================================================
+# Overlay on v35 by digest. Changes 4 Python files, installs nothing, adds no models.
+# - setup_models.ensure_upscale_model: with MODEL_SOURCE=hf_cache the SeedVR2 files are linked from the cached
+#   HF repo FIRST (<snapshot>/diffusion_models/seedvr2_3b_fp16.safetensors, <snapshot>/vae/seedvr2_ema_vae_fp16
+#   .safetensors), so the upscale needs no network volume. HF_CACHE_FALLBACK=0: a missing file is a clear error.
+# - "mode": "upscale_only" + "upscale": "1080p": exact target size (upscale_width x upscale_height, default
+#   1920x1080), RAM per frame scaled to it, "upscale_crf" for the returned file.
+# - Results above UPSCALE_BASE64_MAX_MB (default 15) go to the S3 bucket (BUCKET_ENDPOINT_URL,
+#   BUCKET_ACCESS_KEY_ID, BUCKET_SECRET_ACCESS_KEY, BUCKET_NAME) as a 7-day presigned URL; else base64.
+# The generation path is unchanged: a v35 generation endpoint can stay on v35.
+#
+# Upscale endpoint env: MODEL_LOCK=0, MODEL_SOURCE=hf_cache, HF_CACHE_REPO, HF_CACHE_REVISION, HF_CACHE_FALLBACK=0,
+# plus the BUCKET_* variables. Push only to a PRIVATE repository (see Dockerfile.v35).
+ARG BASE_IMAGE=digamberjhazaran/infinitetalk-runpod@sha256:8979e772ec3db6334d4901c25a549bfd9da09c5f1ea9fc9d8728a374e60304c9
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-c"]
+
+# 1. Baseline: the 4 replaced files must be the v35 ones; everything else is fingerprinted
+RUN /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_pre.txt && \
+    printf '%s\n' \
+      "49a2736caf5ae03222e3bd31fc80effcceab054b613668cfbb6202784e14019e  /setup_models.py" \
+      "f13c0265be9729af7de5622668b7152c01d13f20d00772e18e9c703959d485d4  /worker_guard/job_guard.py" \
+      "01d19465de5bd4211b73e811df93e70077f2d7c056e3f9819e7aea468959cc7f  /worker_guard/modes.py" \
+      "62b86a2a9313ababda9df78fb96e353b634ed9ad76def8fc922864610a1ac612  /worker_guard/upscale.py" \
+      | sha256sum -c --quiet && \
+    sha256sum /handler.py /entrypoint.sh /locked_model_config.json /extra_model_paths.yaml /Upscale_SeedVR2.json \
+        /I2V_single.json /I2V_multi.json /V2V_single.json /V2V_multi.json \
+        /I2V_single_compiled.json /I2V_multi_compiled.json > /tmp/unchanged.sha256 && \
+    find /worker_guard -type f -name '*.py' \
+        -not -name job_guard.py -not -name modes.py -not -name upscale.py -print0 \
+        | sort -z | xargs -0 sha256sum >> /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes.sha256 && \
+    find /ComfyUI/comfy /ComfyUI/comfy_extras -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum > /tmp/comfy_core.sha256
+
+# 2. v36 code
+COPY setup_models.py /
+COPY worker_guard/job_guard.py worker_guard/modes.py worker_guard/upscale.py /worker_guard/
+RUN sed -i 's/\r$//' /setup_models.py /worker_guard/job_guard.py /worker_guard/modes.py /worker_guard/upscale.py && \
+    chmod 755 /setup_models.py && \
+    cd / && python -c "import setup_models, worker_guard.job_guard, worker_guard.modes as m, worker_guard.upscale as u, boto3; \
+assert m.requested_size({'upscale': '1080p'}, 848, 480) == (1920, 1080); \
+assert u.target_size(848, 480) == (1280, 720) and u.target_size(848, 480, (1920, 1080)) == (1920, 1080); \
+from runpod.serverless.utils import rp_upload; assert callable(rp_upload.upload_file_to_bucket); \
+print('v36 imports OK')" && \
+    rm -rf /worker_guard/__pycache__ /__pycache__
+
+# 3. LAST RUN STEP: unchanged files + custom nodes + ComfyUI core, zero package drift
+RUN sha256sum -c --quiet /tmp/unchanged.sha256 && \
+    find /ComfyUI/custom_nodes -type f -not -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum > /tmp/custom_nodes_post.sha256 && \
+    diff -u /tmp/custom_nodes.sha256 /tmp/custom_nodes_post.sha256 && \
+    find /ComfyUI/comfy /ComfyUI/comfy_extras -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum > /tmp/comfy_core_post.sha256 && \
+    diff -u /tmp/comfy_core.sha256 /tmp/comfy_core_post.sha256 && \
+    /usr/bin/python3.10 -m pip freeze > /tmp/comfy_freeze_post.txt && \
+    diff -u /tmp/comfy_freeze_pre.txt /tmp/comfy_freeze_post.txt || { \
+        echo "CRITICAL ERROR: files, custom nodes, ComfyUI core or the Python environment changed during the v36 build!"; \
+        exit 1; \
+    } && \
+    rm -f /tmp/comfy_freeze_*.txt /tmp/unchanged.sha256 /tmp/custom_nodes*.sha256 /tmp/comfy_core*.sha256 && \
+    echo "OK: v36 built. Only setup_models.py + job_guard.py + modes.py + upscale.py changed. Zero package drift."

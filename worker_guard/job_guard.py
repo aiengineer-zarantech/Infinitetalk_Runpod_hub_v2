@@ -981,8 +981,49 @@ def _end_of_video_job(ctx, result):
         pass
 
 
-def _deliver(path, network_volume, task_id):
-    """The upscale_only result, like handler.py returns a video: base64, or a copy on the network volume."""
+BUCKET_ENV = ("BUCKET_ENDPOINT_URL", "BUCKET_ACCESS_KEY_ID", "BUCKET_SECRET_ACCESS_KEY", "BUCKET_NAME")
+
+
+def _base64_max_bytes():
+    """UPSCALE_BASE64_MAX_MB (default 15): with output_upload "auto", larger results go to the bucket."""
+    try:
+        return float(os.environ.get("UPSCALE_BASE64_MAX_MB", "").strip() or 15) * 1024 ** 2
+    except ValueError:
+        return 15 * 1024 ** 2
+
+
+def _bucket_upload(path, task_id, job_input):
+    """v36: presigned URL of the result in the S3 bucket (BUCKET_* env), or None for base64.
+    output_upload "base64" never uploads; "bucket" always (when configured); "auto" (default) only above
+    UPSCALE_BASE64_MAX_MB. A failed upload logs and falls back to base64."""
+    mode = str((job_input or {}).get("output_upload", "auto")).strip().lower()
+    if mode == "base64":
+        return None
+    size = os.path.getsize(path)
+    if mode == "auto" and size <= _base64_max_bytes():
+        return None
+    missing = [k for k in BUCKET_ENV if not os.environ.get(k, "").strip()]
+    if missing:
+        logger.warning(f"[OUTPUT] {size / 1024 ** 2:.1f} MB result returned as base64: bucket not configured "
+                       f"({', '.join(missing)} unset)")
+        return None
+    try:
+        from runpod.serverless.utils import rp_upload
+        url = rp_upload.upload_file_to_bucket(file_name=f"{task_id}.mp4", file_location=path,
+                                              bucket_name=os.environ["BUCKET_NAME"].strip(), prefix="upscaled")
+    except Exception as e:
+        logger.error(f"[OUTPUT] bucket upload failed ({type(e).__name__}: {e}); returning base64")
+        return None
+    if not str(url).startswith("http"):
+        logger.error("[OUTPUT] bucket upload returned no URL (boto3 missing?); returning base64")
+        return None
+    logger.info(f"[OUTPUT] {size / 1024 ** 2:.1f} MB result uploaded to the bucket (presigned URL, 7 days)")
+    return url
+
+
+def _deliver(path, network_volume, task_id, job_input=None):
+    """The upscale_only result, like handler.py returns a video: base64, a copy on the network volume, or
+    (v36) a presigned bucket URL {"video_url": ..., "upload": "bucket"} (see _bucket_upload)."""
     import base64
     import shutil
     try:
@@ -990,6 +1031,9 @@ def _deliver(path, network_volume, task_id):
             target = f"/runpod-volume/infinitetalk_{task_id}.mp4"
             shutil.copy2(path, target)
             return {"video_path": target}
+        url = _bucket_upload(path, task_id, job_input)
+        if url:
+            return {"video_url": url, "upload": "bucket"}
         with open(path, "rb") as f:
             return {"video": base64.b64encode(f.read()).decode("utf-8")}
     finally:
@@ -1153,7 +1197,7 @@ def _upscale_only(ctx, job_input):
         message = f"[UPSCALE] failed: {error}"
         logger.error(message)
         return {"error": message[:1500]}
-    return _deliver(up.path, job_input.get("network_volume", False), task_id)
+    return _deliver(up.path, job_input.get("network_volume", False), task_id, job_input)
 
 
 def final_offload_check(prompt):

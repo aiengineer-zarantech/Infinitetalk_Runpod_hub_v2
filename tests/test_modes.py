@@ -79,7 +79,7 @@ def test_old_jobs_with_upscale_none_are_unchanged():
 @pytest.mark.parametrize("job_input, message", [
     ({"upscale": "720p"}, "upscale is only available with mode 'fast480' or 'upscale_only'"),
     ({"mode": "standard", "upscale": "720p"}, "upscale is only available"),
-    ({"mode": "fast480", "upscale": "4k"}, "upscale must be '720p' or 'none'"),
+    ({"mode": "fast480", "upscale": "4k"}, "upscale must be '720p', '1080p' or 'none'"),
     ({"mode": "fast480", "upscale_model": "1b"}, "upscale_model must be one of ['3b', '7b']"),
     ({"mode": "upscale_only"}, "upscale_only needs one of ['video_base64', 'video_url', 'video_path']"),
     ({"mode": "upscale_only", "video_path": "/x.mp4", "upscale": "none"}, "nothing to do"),

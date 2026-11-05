@@ -501,9 +501,10 @@ def _copy_and_link(m):
     _log(f"   ✅ [LINKED] {model_name} ({size_mb:.1f} MB) -> {dest_path}")
 
 
-def ensure_model(model_name, subfolder=None, source_subfolder=None):
+def ensure_model(model_name, subfolder=None, source_subfolder=None, use_hf_cache=True):
     """Copy one model to local disk and link it into ComfyUI if needed (used for LAZY_MODELS).
     source_subfolder: folder on the volume when it differs from the ComfyUI folder (upscale models).
+    use_hf_cache=False: skip the HF cache / baked link (ensure_upscale_model after it rejected the cached copy).
 
     Safe to call repeatedly: returns quickly when the link is already valid. Raises on failure.
     """
@@ -513,7 +514,7 @@ def ensure_model(model_name, subfolder=None, source_subfolder=None):
     with _ensure_lock:
         start = time.time()
         dest_path, local_path = model_paths(model_name, subfolder)
-        if model_source() in ("hf_cache", "baked"):
+        if use_hf_cache and model_source() in ("hf_cache", "baked"):
             try:
                 cached = hf_cache_file(linked_source_dir(), model_name, subfolder)
             except HFCacheError as e:
@@ -615,12 +616,32 @@ def download_upscale_model(model_name, urlopen=None):
 
 
 def ensure_upscale_model(model_name):
-    """Volume (download once if missing) -> local disk -> /ComfyUI/models/<folder>. Returns ensure_model's info."""
+    """HF cache (hf_cache/baked, no download) -> else volume (download once if missing) -> local disk
+    -> /ComfyUI/models/<folder>. Returns ensure_model's info."""
     spec = UPSCALE_MODELS[model_name]
+
+    # v36: in hf_cache/baked mode use the cached copy first, so no 6.8 GB download on cold workers
+    if model_source() in ("hf_cache", "baked"):
+        try:
+            cached = hf_cache_file(linked_source_dir(), model_name, spec["folder"])
+        except HFCacheError as e:
+            cached = None
+            _log(f"   ⚠️ [UPSCALE] {model_name}: HF cache not usable ({e}); falling back to volume/download")
+        if cached:
+            size = os.path.getsize(cached)
+            if size == spec["size"]:
+                _log(f"   ✅ [UPSCALE] {model_name} from HF cache, no download ({size / 1024 ** 3:.2f} GB)")
+                return ensure_model(model_name, spec["folder"], source_subfolder=UPSCALE_SOURCE_FOLDER)
+            _log(f"   ⚠️ [UPSCALE] {model_name}: HF cache size {size} != {spec['size']}; "
+                 f"falling back to volume/download")
+        else:
+            _log(f"   ⚠️ [UPSCALE] {model_name} not in HF cache; falling back to volume/download")
+
     src = find_source(model_name, UPSCALE_SOURCE_FOLDER) or download_upscale_model(model_name)
     if os.path.getsize(src) != spec["size"]:
         raise IOError(f"{src} has {os.path.getsize(src)} bytes, expected {spec['size']} ({UPSCALE_HF_REPO})")
-    return ensure_model(model_name, spec["folder"], source_subfolder=UPSCALE_SOURCE_FOLDER)
+    # use_hf_cache=False: ensure_model would otherwise link the cached copy that was just rejected (wrong size)
+    return ensure_model(model_name, spec["folder"], source_subfolder=UPSCALE_SOURCE_FOLDER, use_hf_cache=False)
 
 
 def prepare_startup_upscale_models():
